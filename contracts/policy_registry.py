@@ -273,16 +273,27 @@ class PolicyRegistry(gl.Contract):
         key = _policy_key(policy_id)
 
         if key in self.policies and version in self.policies[key]:
-            raise Exception("policy version already registered - cannot mutate an existing version")
+            raise gl.vm.UserError("policy version already registered - cannot mutate an existing version")
 
         if int(min_unique_validators) < 1:
-            raise Exception("min_unique_validators must be >= 1 (spec S36)")
+            raise gl.vm.UserError("min_unique_validators must be >= 1 (spec S36)")
 
         for pr in predicate_rules:
             PredicateType(pr)  # fail closed on unknown predicate type
 
-        if evidence_max_age_seconds > 0:
+        # Validated unconditionally, not only when evidence_max_age_seconds
+        # > 0: `_to_content`/`commit_policy` below always runs this value
+        # through `FreshnessOnExpiry(...)` too (it's part of the hashed
+        # content regardless of whether freshness checking is active for
+        # this policy), so skipping the check here just moves an invalid
+        # value's failure a few lines down into a raw, uncaught
+        # `ValueError` instead of the clean `gl.vm.UserError`-style
+        # message every other input-validation failure in this file uses.
+        # Found via Direct Mode testing (test_policy_registry.py).
+        try:
             FreshnessOnExpiry(evidence_freshness_on_expiry)
+        except ValueError:
+            raise gl.vm.UserError(f"invalid evidence_freshness_on_expiry: {evidence_freshness_on_expiry!r}")
 
         predicate_rules_str = ",".join(predicate_rules)
 
@@ -328,10 +339,10 @@ class PolicyRegistry(gl.Contract):
         policy_id = _coerce_bytes(policy_id)
         key = _policy_key(policy_id)
         if key not in self.policies or version not in self.policies[key]:
-            raise Exception("unknown policy version")
+            raise gl.vm.UserError("unknown policy version")
         record = self.policies[key][version]
         if str(gl.message.sender_address) != record.registrant:
-            raise Exception("only the original registrant may change a policy version's active flag")
+            raise gl.vm.UserError("only the original registrant may change a policy version's active flag")
         record.active = active
 
     @gl.public.view
@@ -339,7 +350,7 @@ class PolicyRegistry(gl.Contract):
         policy_id = _coerce_bytes(policy_id)
         key = _policy_key(policy_id)
         if key not in self.policies or version not in self.policies[key]:
-            raise Exception("unknown policy version")
+            raise gl.vm.UserError("unknown policy version")
         return self.policies[key][version].policy_hash.hex()
 
     @gl.public.view
@@ -366,15 +377,29 @@ class PolicyRegistry(gl.Contract):
         policy_id = _coerce_bytes(policy_id)
         key = _policy_key(policy_id)
         if key not in self.policies or version not in self.policies[key]:
-            raise Exception("unknown policy version")
+            raise gl.vm.UserError("unknown policy version")
         return self.policies[key][version].min_unique_validators
+
+    @gl.public.view
+    def get_predicate_rules(self, policy_id: bytes, version: u32) -> list[str]:
+        """Added (session 2026-09-14, finding #3): this field was stored
+        and hashed since the beginning but never exposed via any getter,
+        so nothing outside this contract could ever check a claim's
+        predicate_type against it -- decorative by omission. ClaimEngine
+        now calls this from register_claim."""
+        policy_id = _coerce_bytes(policy_id)
+        key = _policy_key(policy_id)
+        if key not in self.policies or version not in self.policies[key]:
+            raise gl.vm.UserError("unknown policy version")
+        stored = self.policies[key][version].predicate_rules
+        return [p for p in stored.split(",") if p]
 
     @gl.public.view
     def get_graph_limits(self, policy_id: bytes, version: u32) -> tuple[u32, u32, u32, u32, u32, u32]:
         policy_id = _coerce_bytes(policy_id)
         key = _policy_key(policy_id)
         if key not in self.policies or version not in self.policies[key]:
-            raise Exception("unknown policy version")
+            raise gl.vm.UserError("unknown policy version")
         gl_ = self.policies[key][version].graph_limits
         return (
             gl_.max_graph_nodes, gl_.max_graph_edges, gl_.max_graph_depth,
@@ -386,7 +411,7 @@ class PolicyRegistry(gl.Contract):
         policy_id = _coerce_bytes(policy_id)
         key = _policy_key(policy_id)
         if key not in self.policies or version not in self.policies[key]:
-            raise Exception("unknown policy version")
+            raise gl.vm.UserError("unknown policy version")
         return self.policies[key][version].allow_revocation_retry
 
     @gl.public.view
@@ -394,7 +419,7 @@ class PolicyRegistry(gl.Contract):
         policy_id = _coerce_bytes(policy_id)
         key = _policy_key(policy_id)
         if key not in self.policies or version not in self.policies[key]:
-            raise Exception("unknown policy version")
+            raise gl.vm.UserError("unknown policy version")
         s = self.policies[key][version]
         return (s.evidence_max_age_seconds, s.evidence_freshness_on_expiry)
 
@@ -403,5 +428,5 @@ class PolicyRegistry(gl.Contract):
         policy_id = _coerce_bytes(policy_id)
         key = _policy_key(policy_id)
         if key not in self.policies or version not in self.policies[key]:
-            raise Exception("unknown policy version")
+            raise gl.vm.UserError("unknown policy version")
         return self.policies[key][version].min_deposit
