@@ -367,6 +367,37 @@ def _to_content(stored: StoredClaim) -> ClaimContent:
 _REFUND_STATES = {ClaimState.TRUE.value, ClaimState.FALSE.value}
 _FORFEIT_STATES = {ClaimState.UNKNOWN.value, ClaimState.EXPIRED.value}
 
+# Independent of any policy's evidence_max_age_seconds (see the comment
+# in expire_claim) -- this bounds how long a claim may sit in
+# ADJUDICATING (e.g. a permanently unreachable retrieval_hint_uri that
+# never lets gl.eq_principle.strict_eq converge) before it becomes
+# recoverable via expire_claim, regardless of whether the policy
+# configures evidence freshness at all. Not currently policy-configurable
+# -- a fixed conservative value, chosen to comfortably exceed how long a
+# legitimate, eventually-successful adjudication round should ever take.
+STUCK_ADJUDICATION_TIMEOUT_SECONDS = 3600
+
+
+def _claim_state_for_expiry(on_expiry: str) -> str:
+    """Maps a policy's FreshnessOnExpiry choice to a ClaimState.
+
+    Found in review (session 2026-09-14): FreshnessOnExpiry.INVALIDATED
+    and ClaimState.INVALIDATED share the literal string "INVALIDATED".
+    Writing `on_expiry` straight into `stored.state` therefore produced a
+    ClaimState value byte-for-byte indistinguishable from
+    invalidate_claim's own, human-initiated INVALIDATED -- even though
+    "evidence went stale (or was never readable) before adjudication
+    finished" and "a TRUE verdict was revoked after being reached" are
+    different events with different implications for the ProcessGraph
+    slot bound to this claim. Mapped instead to the pre-existing (and,
+    before this fix, entirely unreachable) ClaimState.EXPIRED, which
+    already carried the correct deposit-forfeiture semantics in
+    _FORFEIT_STATES; ProcessGraph.bind_slot now handles EXPIRED
+    explicitly alongside INVALIDATED instead of conflating the two."""
+    if on_expiry == FreshnessOnExpiry.INVALIDATED.value:
+        return ClaimState.EXPIRED.value
+    return ClaimState.UNKNOWN.value
+
 
 def _coerce_address(val) -> Address:
     """Defensive coercion for any Address-typed argument coming in from a
@@ -469,19 +500,39 @@ class ClaimEngine(gl.Contract):
         expected_evidence_commitment = _coerce_bytes(expected_evidence_commitment)
         PredicateType(predicate_type)
 
+        # Added (session 2026-09-14, finding #8): _require() only checked
+        # that quantity fields were supplied (not None), never that they
+        # were sane -- "at least -500 GRAMS" was accepted silently.
+        if predicate_type in (PredicateType.QUANTITY_AT_LEAST.value, PredicateType.QUANTITY_EQUALS.value):
+            if int(predicate_value) < 0:
+                raise gl.vm.UserError(f"predicate_value must be >= 0 for {predicate_type!r}, got {predicate_value}")
+
         policy_registry = gl.get_contract_at(self.policy_registry_address)
         if not policy_registry.view().verify_commitment(policy_id, policy_version, expected_policy_commitment):
-            raise Exception("policy_commitment does not match PolicyRegistry's committed content")
+            raise gl.vm.UserError("policy_commitment does not match PolicyRegistry's committed content")
         if not policy_registry.view().is_active(policy_id, policy_version):
-            raise Exception("policy version is not active - cannot register new claims against it")
+            raise gl.vm.UserError("policy version is not active - cannot register new claims against it")
 
         min_deposit = policy_registry.view().get_min_deposit(policy_id, policy_version)
         if gl.message.value < min_deposit:
-            raise Exception(f"deposit too small: sent {gl.message.value}, policy requires >= {min_deposit} (spec S38)")
+            raise gl.vm.UserError(f"deposit too small: sent {gl.message.value}, policy requires >= {min_deposit} (spec S38)")
+
+        # Added (session 2026-09-14, finding #3): predicate_rules was
+        # stored and hashed by PolicyRegistry from the beginning but
+        # never actually checked anywhere -- a policy declaring "only
+        # QuantityAtLeast is allowed" was silently permitting all six
+        # PredicateType values, since register_claim only validated
+        # predicate_type against the global enum, never against this
+        # specific policy's whitelist.
+        allowed_predicate_rules = policy_registry.view().get_predicate_rules(policy_id, policy_version)
+        if predicate_type not in allowed_predicate_rules:
+            raise gl.vm.UserError(
+                f"predicate_type {predicate_type!r} is not in this policy's predicate_rules {allowed_predicate_rules!r}"
+            )
 
         evidence_registry = gl.get_contract_at(self.evidence_registry_address)
         if not evidence_registry.view().verify_commitment(evidence_id, expected_evidence_commitment, schema_version):
-            raise Exception("evidence_commitment does not match EvidenceRegistry's committed content")
+            raise gl.vm.UserError("evidence_commitment does not match EvidenceRegistry's committed content")
 
         limits = policy_registry.view().get_graph_limits(policy_id, policy_version)
         max_claims_per_process = limits[3]
@@ -490,7 +541,22 @@ class ClaimEngine(gl.Contract):
 
         artifact_size = evidence_registry.view().get_artifact_size(evidence_id)
         if int(artifact_size) > int(max_evidence_size):
-            raise Exception(f"evidence artifact_size {artifact_size} exceeds policy max_evidence_size {max_evidence_size}")
+            raise gl.vm.UserError(f"evidence artifact_size {artifact_size} exceeds policy max_evidence_size {max_evidence_size}")
+
+        # Partial mitigation for the caller-supplied-`now` trust gap (see
+        # SECURITY.md "Caller-supplied time" and the comment in
+        # adjudicate_claim): a claim asserting something about a piece of
+        # evidence should not be able to claim a `now` earlier than when
+        # that evidence itself was submitted. This does not verify `now`
+        # against real wall-clock time (impossible without an on-chain
+        # clock in this build), only against this one relative fact this
+        # contract already has independently, via EvidenceRegistry.
+        evidence_submitted_at = evidence_registry.view().get_submitted_at(evidence_id)
+        if int(now) < int(evidence_submitted_at):
+            raise gl.vm.UserError(
+                f"now ({now}) precedes the referenced evidence's own submitted_at "
+                f"({evidence_submitted_at}) - a claim cannot assert evidence from the future"
+            )
 
         predicate_size = (
             len(predicate_unit.encode("utf-8"))
@@ -500,17 +566,17 @@ class ClaimEngine(gl.Contract):
             + len(subject_description.encode("utf-8"))
         )
         if predicate_size > int(max_predicate_size):
-            raise Exception(f"predicate parameter size {predicate_size} exceeds policy max_predicate_size {max_predicate_size}")
+            raise gl.vm.UserError(f"predicate parameter size {predicate_size} exceeds policy max_predicate_size {max_predicate_size}")
 
         process_key = process_commitment.hex()
         current_count = self.claims_per_process[process_key] if process_key in self.claims_per_process else u32(0)
         if int(current_count) + 1 > int(max_claims_per_process):
-            raise Exception(f"registering this claim would exceed policy max_claims_per_process ({max_claims_per_process}) for this process - spec S39")
+            raise gl.vm.UserError(f"registering this claim would exceed policy max_claims_per_process ({max_claims_per_process}) for this process - spec S39")
 
         if scope not in ("PROCESS", "POLICY", "GLOBAL"):
-            raise Exception(f"invalid scope: {scope!r}")
+            raise gl.vm.UserError(f"invalid scope: {scope!r}")
         if scope != "PROCESS":
-            raise Exception("POLICY/GLOBAL claim scope is not implemented in this MVP - see SECURITY.md")
+            raise gl.vm.UserError("POLICY/GLOBAL claim scope is not implemented in this MVP - see SECURITY.md")
 
         asserted_at = now
 
@@ -545,7 +611,7 @@ class ClaimEngine(gl.Contract):
         claim_key = claim_hash.hex()
 
         if claim_key in self.claims:
-            raise Exception("claim_id collision on registration - refusing to overwrite")
+            raise gl.vm.UserError("claim_id collision on registration - refusing to overwrite")
 
         self.claims[claim_key] = stored
         self.claims_per_process[process_key] = u32(int(current_count) + 1)
@@ -556,11 +622,29 @@ class ClaimEngine(gl.Contract):
         claim_id = _coerce_bytes(claim_id)
         claim_key = claim_id.hex()
         if claim_key not in self.claims:
-            raise Exception("unknown claim_id")
+            raise gl.vm.UserError("unknown claim_id")
         stored = self.claims[claim_key]
 
         if stored.state != ClaimState.REGISTERED.value:
-            raise Exception(f"claim is in state {stored.state!r} - only REGISTERED claims can be adjudicated (spec S19)")
+            raise gl.vm.UserError(f"claim is in state {stored.state!r} - only REGISTERED claims can be adjudicated (spec S19)")
+
+        # Partial mitigation for the caller-supplied-`now` trust gap
+        # documented in SECURITY.md ("Caller-supplied time"): there is no
+        # on-chain clock in this GenVM build (KNOWN_ISSUES.md #5), so `now`
+        # cannot be verified against reality -- but it CAN be constrained
+        # to be monotonic within this claim's own lifecycle. Without this,
+        # a caller could call adjudicate_claim with a `now` earlier than
+        # the `now` they themselves supplied at register_claim time,
+        # trivially defeating the freshness check below regardless of how
+        # much real time has actually passed. This does not close the gap
+        # entirely (register_claim's own `now` is still caller-asserted,
+        # unchecked against anything at that point), only the "go
+        # backwards relative to your own prior call on this claim" case.
+        if int(now) < int(stored.asserted_at):
+            raise gl.vm.UserError(
+                f"now ({now}) precedes this claim's own asserted_at ({stored.asserted_at}) "
+                "- time must be monotonic within a claim's lifecycle"
+            )
 
         policy_registry = gl.get_contract_at(self.policy_registry_address)
         evidence_registry = gl.get_contract_at(self.evidence_registry_address)
@@ -571,7 +655,7 @@ class ClaimEngine(gl.Contract):
         if int(max_age) > 0:
             now = int(now)
             if now - int(evidence_submitted_at) > int(max_age):
-                stored.state = on_expiry
+                stored.state = _claim_state_for_expiry(on_expiry)
                 self._settle_deposit(stored)
                 return stored.state
 
@@ -621,7 +705,7 @@ class ClaimEngine(gl.Contract):
                 ThreeValued.UNKNOWN.value: ClaimState.UNKNOWN.value,
             }[v]
         else:
-            raise Exception(f"unreachable: unexpected strict_eq result {result!r}")
+            raise gl.vm.UserError(f"unreachable: unexpected strict_eq result {result!r}")
 
         self._settle_deposit(stored)
         return stored.state
@@ -631,15 +715,28 @@ class ClaimEngine(gl.Contract):
         claim_id = _coerce_bytes(claim_id)
         claim_key = claim_id.hex()
         if claim_key not in self.claims:
-            raise Exception("unknown claim_id")
+            raise gl.vm.UserError("unknown claim_id")
         stored = self.claims[claim_key]
 
+        # Found in review (session 2026-09-14): this method had NO sender
+        # check at all -- any address could invalidate any other party's
+        # already-consensus-reached TRUE verdict. Minimum viable fix,
+        # matching this file's own authority-model precedent elsewhere
+        # (only the interested party can act): restrict to the claim's
+        # own submitter. This is NOT a dispute mechanism -- it only closes
+        # the "any address, no legitimate interest required" hole. A real
+        # revocation-dispute process (e.g. a second consensus round to
+        # adjudicate the revocation itself) is out of scope for this fix;
+        # see SECURITY.md.
+        if str(gl.message.sender_address) != stored.submitter:
+            raise gl.vm.UserError("only the claim's own submitter may invalidate it")
+
         if stored.state != ClaimState.TRUE.value:
-            raise Exception("only a TRUE claim may be invalidated (spec S19)")
+            raise gl.vm.UserError("only a TRUE claim may be invalidated (spec S19)")
 
         policy_registry = gl.get_contract_at(self.policy_registry_address)
         if not policy_registry.view().get_allow_revocation_retry(stored.policy_id, stored.policy_version):
-            raise Exception("policy does not permit revocation for this claim")
+            raise gl.vm.UserError("policy does not permit revocation for this claim")
 
         stored.state = ClaimState.INVALIDATED.value
 
@@ -648,32 +745,60 @@ class ClaimEngine(gl.Contract):
         claim_id = _coerce_bytes(claim_id)
         claim_key = claim_id.hex()
         if claim_key not in self.claims:
-            raise Exception("unknown claim_id")
+            raise gl.vm.UserError("unknown claim_id")
         stored = self.claims[claim_key]
 
         if stored.state not in (ClaimState.REGISTERED.value, ClaimState.ADJUDICATING.value, ClaimState.UNKNOWN.value):
-            raise Exception(f"cannot expire a claim in terminal state {stored.state!r}")
+            raise gl.vm.UserError(f"cannot expire a claim in terminal state {stored.state!r}")
+
+        # Same monotonicity mitigation as adjudicate_claim -- see the
+        # comment there.
+        if int(now) < int(stored.asserted_at):
+            raise gl.vm.UserError(
+                f"now ({now}) precedes this claim's own asserted_at ({stored.asserted_at}) "
+                "- time must be monotonic within a claim's lifecycle"
+            )
 
         policy_registry = gl.get_contract_at(self.policy_registry_address)
         evidence_registry = gl.get_contract_at(self.evidence_registry_address)
 
         max_age, on_expiry = policy_registry.view().get_freshness(stored.policy_id, stored.policy_version)
-        if int(max_age) == 0:
-            raise Exception("no freshness rule configured for this policy - cannot expire")
-
         now = int(now)
-        evidence_submitted_at = evidence_registry.view().get_submitted_at(stored.evidence_id)
-        evidence_stale = (now - int(evidence_submitted_at)) > int(max_age)
+
+        # These are two independent policy-author decisions and must not
+        # gate each other (found in review, session 2026-09-14): a policy
+        # author choosing not to check evidence freshness (max_age == 0)
+        # says nothing about whether a claim that can never actually
+        # adjudicate -- e.g. a permanently dead retrieval_hint_uri, where
+        # gl.eq_principle.strict_eq keeps failing to converge and every
+        # adjudicate_claim() call reverts, leaving the claim honestly
+        # REGISTERED (GenVM transactions are atomic -- a non-converging
+        # equivalence round rolls the whole call back, it does not leave
+        # the claim stuck mid-state) but retried forever with zero
+        # progress -- should be permanently unrecoverable. Before this
+        # fix, `stuck_adjudicating` below was gated on the SAME `max_age`
+        # as evidence staleness, so max_age == 0 (a valid, common policy
+        # choice) silently also meant "this claim, and the ProcessGraph
+        # slot bound to it, can never be expired, ever" -- a process-wide
+        # liveness bug with no connection to what the policy author
+        # actually opted into.
+        evidence_stale = False
+        if int(max_age) > 0:
+            evidence_submitted_at = evidence_registry.view().get_submitted_at(stored.evidence_id)
+            evidence_stale = (now - int(evidence_submitted_at)) > int(max_age)
 
         stuck_adjudicating = (
             stored.state == ClaimState.ADJUDICATING.value
-            and (now - int(stored.asserted_at)) > int(max_age)
+            and (now - int(stored.asserted_at)) > STUCK_ADJUDICATION_TIMEOUT_SECONDS
         )
 
         if not (evidence_stale or stuck_adjudicating):
-            raise Exception("evidence is not stale yet, and claim is not stuck in ADJUDICATING long enough - cannot expire")
+            raise gl.vm.UserError(
+                "evidence is not stale yet (or no freshness rule is configured), and claim "
+                "is not stuck in ADJUDICATING long enough - cannot expire"
+            )
 
-        stored.state = on_expiry
+        stored.state = _claim_state_for_expiry(on_expiry)
         self._settle_deposit(stored)
         return stored.state
 
@@ -698,7 +823,7 @@ class ClaimEngine(gl.Contract):
         sender = str(gl.message.sender_address)
         amount = self.withdrawable[sender] if sender in self.withdrawable else u256(0)
         if int(amount) == 0:
-            raise Exception("nothing to withdraw")
+            raise gl.vm.UserError("nothing to withdraw")
         self.withdrawable[sender] = u256(0)
         self._send_native(sender, amount)
         return amount
@@ -706,10 +831,10 @@ class ClaimEngine(gl.Contract):
     @gl.public.write
     def withdraw_protocol_sink(self, to: str) -> u256:
         if str(gl.message.sender_address) != self.admin_address:
-            raise Exception("only admin may withdraw the protocol sink")
+            raise gl.vm.UserError("only admin may withdraw the protocol sink")
         amount = self.protocol_sink
         if int(amount) == 0:
-            raise Exception("protocol sink is empty")
+            raise gl.vm.UserError("protocol sink is empty")
         self.protocol_sink = u256(0)
         self._send_native(to, amount)
         return amount
@@ -723,15 +848,26 @@ class ClaimEngine(gl.Contract):
         claim_id = _coerce_bytes(claim_id)
         claim_key = claim_id.hex()
         if claim_key not in self.claims:
-            raise Exception("unknown claim_id")
+            raise gl.vm.UserError("unknown claim_id")
         return self.claims[claim_key].state
+
+    @gl.public.view
+    def get_deposit_amount(self, claim_id: bytes) -> u256:
+        """Needed by ProcessGraph's bond-escalation dispute window
+        (see bind_slot) to compare a challenger's claim deposit against
+        the currently-pending claim's deposit."""
+        claim_id = _coerce_bytes(claim_id)
+        claim_key = claim_id.hex()
+        if claim_key not in self.claims:
+            raise gl.vm.UserError("unknown claim_id")
+        return self.claims[claim_key].deposit_amount
 
     @gl.public.view
     def get_provenance(self, claim_id: bytes) -> tuple[str, str, str, str, str]:
         claim_id = _coerce_bytes(claim_id)
         claim_key = claim_id.hex()
         if claim_key not in self.claims:
-            raise Exception("unknown claim_id")
+            raise gl.vm.UserError("unknown claim_id")
         s = self.claims[claim_key]
         return (s.process_commitment.hex(), s.policy_commitment.hex(), s.subject_commitment.hex(), s.evidence_commitment.hex(), s.schema_version)
 
@@ -740,7 +876,7 @@ class ClaimEngine(gl.Contract):
         claim_id = _coerce_bytes(claim_id)
         claim_key = claim_id.hex()
         if claim_key not in self.claims:
-            raise Exception("unknown claim_id")
+            raise gl.vm.UserError("unknown claim_id")
         s = self.claims[claim_key]
         return (
             s.predicate_type, s.predicate_value, s.predicate_unit, s.predicate_date,
