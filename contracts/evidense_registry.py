@@ -228,9 +228,9 @@ class EvidenceRegistry(gl.Contract):
         authority_commitment = _coerce_bytes(authority_commitment)
         scope_commitment = _coerce_bytes(scope_commitment)
         if len(artifact_hash) == 0:
-            raise Exception("artifact_hash must not be empty - a URL alone is never identity (spec S10)")
+            raise gl.vm.UserError("artifact_hash must not be empty - a URL alone is never identity (spec S10)")
         if int(artifact_size) == 0:
-            raise Exception("artifact_size must be > 0")
+            raise gl.vm.UserError("artifact_size must be > 0")
 
         content = StoredEvidenceContent(
             artifact_hash=artifact_hash,
@@ -262,28 +262,28 @@ class EvidenceRegistry(gl.Contract):
         """Explicit, allow-listed lifecycle transition only. No generic
         setter - every jump not on the allow-list is rejected."""
         if evidence_id not in self.evidence:
-            raise Exception("unknown evidence_id")
+            raise gl.vm.UserError("unknown evidence_id")
         record = self.evidence[evidence_id]
 
         if str(gl.message.sender_address) != record.content.creator:
-            raise Exception("only the original creator may change evidence state in this MVP")
+            raise gl.vm.UserError("only the original creator may change evidence state in this MVP")
 
         transition = (record.state, new_state)
         if transition not in _ALLOWED_TRANSITIONS:
-            raise Exception(f"illegal evidence state transition: {record.state} -> {new_state}")
+            raise gl.vm.UserError(f"illegal evidence state transition: {record.state} -> {new_state}")
 
         record.state = new_state
 
     @gl.public.view
     def get_artifact_hash(self, evidence_id: u32) -> str:
         if evidence_id not in self.evidence:
-            raise Exception("unknown evidence_id")
+            raise gl.vm.UserError("unknown evidence_id")
         return self.evidence[evidence_id].content.artifact_hash.hex()
 
     @gl.public.view
     def get_state(self, evidence_id: u32) -> str:
         if evidence_id not in self.evidence:
-            raise Exception("unknown evidence_id")
+            raise gl.vm.UserError("unknown evidence_id")
         return self.evidence[evidence_id].state
 
     @gl.public.view
@@ -291,7 +291,7 @@ class EvidenceRegistry(gl.Contract):
         """NEVER treat this as identity - it exists only so a caller
         knows where to try fetching bytes from (spec S10)."""
         if evidence_id not in self.evidence:
-            raise Exception("unknown evidence_id")
+            raise gl.vm.UserError("unknown evidence_id")
         return self.evidence[evidence_id].retrieval_hint_uri
 
     @gl.public.view
@@ -309,7 +309,7 @@ class EvidenceRegistry(gl.Contract):
     @gl.public.view
     def get_scope_commitment(self, evidence_id: u32) -> str:
         if evidence_id not in self.evidence:
-            raise Exception("unknown evidence_id")
+            raise gl.vm.UserError("unknown evidence_id")
         return self.evidence[evidence_id].content.scope_commitment.hex()
 
     @gl.public.view
@@ -317,7 +317,7 @@ class EvidenceRegistry(gl.Contract):
         """Needed by ClaimEngine's freshness check (Patch 4) - staleness
         must be measured against when the EVIDENCE was committed."""
         if evidence_id not in self.evidence:
-            raise Exception("unknown evidence_id")
+            raise gl.vm.UserError("unknown evidence_id")
         return self.evidence[evidence_id].content.submitted_at
 
     @gl.public.view
@@ -328,5 +328,5 @@ class EvidenceRegistry(gl.Contract):
         caller-asserted number alone, since this contract never fetches
         content itself and cannot verify this value against reality."""
         if evidence_id not in self.evidence:
-            raise Exception("unknown evidence_id")
+            raise gl.vm.UserError("unknown evidence_id")
         return self.evidence[evidence_id].content.artifact_size
