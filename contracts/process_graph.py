@@ -97,8 +97,28 @@ class ClaimState(str, enum.Enum):
 
 class SlotState(str, enum.Enum):
     OPEN = "OPEN"
+    PENDING = "PENDING"
     RESOLVED = "RESOLVED"
     LOCKED = "LOCKED"
+
+
+# Economic defense against slot-squatting / claim front-running (finding
+# #2, session 2026-09-14): register_claim is permissionless and evidence
+# authenticity (EvidenceContent.authority_commitment) is not verified
+# anywhere in this MVP -- a claim satisfying a slot's predicate proves
+# only that its self-hosted evidence is internally consistent with the
+# predicate, never that it is genuine. Previously, whichever claim first
+# called bind_slot with a TRUE/FALSE verdict won the slot permanently.
+# Now, a TRUE/FALSE binding opens a fixed dispute window during which a
+# DIFFERENT claim can displace it, but only by posting a strictly larger
+# deposit (bond escalation, resetting the window on every successful
+# challenge) -- see bind_slot and finalize_slot. This raises the cost of
+# the attack (an attacker must be willing to outbid every legitimate
+# challenger's deposit) but does not eliminate it: a well-funded attacker
+# can still win by posting an arbitrarily large deposit. Not
+# policy-configurable in this fix -- a fixed value, to avoid re-versioning
+# PolicyRegistry's schema/hash for this.
+DISPUTE_WINDOW_SECONDS = 3600
 
 
 class ProcessState(str, enum.Enum):
@@ -196,6 +216,14 @@ class StoredClaimSlot:
     subject_commitment: bytes
     current_claim_id: bytes
     state: str
+    # Added for the bond-escalation dispute window (finding #2, session
+    # 2026-09-14): `bound_at` is when `current_claim_id` became the
+    # PENDING candidate; `bound_deposit` is that claim's own deposit,
+    # cached here so a challenger's deposit can be compared without an
+    # extra cross-contract round-trip. Both are meaningless (left at 0)
+    # once state is OPEN/RESOLVED/LOCKED.
+    bound_at: u64
+    bound_deposit: u256
 
 
 @allow_storage
@@ -398,13 +426,13 @@ class ProcessGraph(gl.Contract):
         expected_policy_commitment = _coerce_bytes(expected_policy_commitment)
         key = process_id.hex()
         if key in self.processes:
-            raise Exception("process_id already exists")
+            raise gl.vm.UserError("process_id already exists")
 
         policy_registry = gl.get_contract_at(self.policy_registry_address)
         if not policy_registry.view().verify_commitment(policy_id, policy_version, expected_policy_commitment):
-            raise Exception("policy_commitment does not match PolicyRegistry's committed content")
+            raise gl.vm.UserError("policy_commitment does not match PolicyRegistry's committed content")
         if not policy_registry.view().is_active(policy_id, policy_version):
-            raise Exception("policy version is not active")
+            raise gl.vm.UserError("policy version is not active")
 
         limits = policy_registry.view().get_graph_limits(policy_id, policy_version)
         allow_revocation_retry = policy_registry.view().get_allow_revocation_retry(policy_id, policy_version)
@@ -447,31 +475,31 @@ class ProcessGraph(gl.Contract):
         node_id = _coerce_bytes(node_id)
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         process = self.processes[key]
         if str(gl.message.sender_address) != process.creator:
-            raise Exception("only the creator may add nodes to this process")
+            raise gl.vm.UserError("only the creator may add nodes to this process")
         if process.state != ProcessState.DRAFT.value:
-            raise Exception("nodes can only be added while process is DRAFT")
+            raise gl.vm.UserError("nodes can only be added while process is DRAFT")
 
         NodeType(node_type)
         node_key = node_id.hex()
         flat_key = f"{key}:{node_key}"
         if flat_key in self.nodes:
-            raise Exception("node_id already exists in this process")
+            raise gl.vm.UserError("node_id already exists in this process")
 
         if int(process.node_count) + 1 > int(process.max_graph_nodes):
-            raise Exception("adding this node would exceed policy max_graph_nodes")
+            raise gl.vm.UserError("adding this node would exceed policy max_graph_nodes")
 
         if node_type == NodeType.THRESHOLD.value:
             if int(threshold_k) < 1 or int(threshold_k) > len(children):
-                raise Exception("THRESHOLD k must satisfy 1 <= k <= len(children)")
+                raise gl.vm.UserError("THRESHOLD k must satisfy 1 <= k <= len(children)")
         if node_type == NodeType.CLAIM.value and len(children) != 0:
-            raise Exception("CLAIM nodes must have no children")
+            raise gl.vm.UserError("CLAIM nodes must have no children")
         if node_type in (NodeType.AND.value, NodeType.OR.value, NodeType.NOT.value) and len(children) == 0:
-            raise Exception(f"{node_type} nodes require at least one child")
+            raise gl.vm.UserError(f"{node_type} nodes require at least one child")
         if node_type == NodeType.NOT.value and len(children) != 1:
-            raise Exception("NOT nodes must have exactly one child")
+            raise gl.vm.UserError("NOT nodes must have exactly one child")
 
         children_str = ",".join(c.hex() for c in children)
 
@@ -507,28 +535,28 @@ class ProcessGraph(gl.Contract):
         subject_commitment = _coerce_bytes(subject_commitment)
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         process = self.processes[key]
         if str(gl.message.sender_address) != process.creator:
-            raise Exception("only the creator may add claim slots to this process")
+            raise gl.vm.UserError("only the creator may add claim slots to this process")
         if process.state != ProcessState.DRAFT.value:
-            raise Exception("claim slots can only be added while process is DRAFT")
+            raise gl.vm.UserError("claim slots can only be added while process is DRAFT")
 
         node_key = node_id.hex()
         flat_key = f"{key}:{node_key}"
         if flat_key not in self.nodes:
-            raise Exception("unknown node_id")
+            raise gl.vm.UserError("unknown node_id")
         node = self.nodes[flat_key]
         if node.node_type != NodeType.CLAIM.value:
-            raise Exception("claim slots may only attach to CLAIM nodes")
+            raise gl.vm.UserError("claim slots may only attach to CLAIM nodes")
         if len(node.claim_slot_id) != 0:
-            raise Exception("this CLAIM node already has a slot bound")
+            raise gl.vm.UserError("this CLAIM node already has a slot bound")
 
         PredicateType(predicate_type)
 
         slot_key = slot_id.hex()
         if slot_key in self.slots:
-            raise Exception("slot_id already exists")
+            raise gl.vm.UserError("slot_id already exists")
 
         slot = StoredClaimSlot(
             slot_id=slot_id,
@@ -543,6 +571,8 @@ class ProcessGraph(gl.Contract):
             subject_commitment=subject_commitment,
             current_claim_id=b"",
             state=SlotState.OPEN.value,
+            bound_at=u64(0),
+            bound_deposit=u256(0),
         )
         self.slots[slot_key] = slot
         node.claim_slot_id = slot_id
@@ -553,12 +583,22 @@ class ProcessGraph(gl.Contract):
         root_node_id = _coerce_bytes(root_node_id)
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         process = self.processes[key]
         if str(gl.message.sender_address) != process.creator:
-            raise Exception("only the creator may commit this process")
+            raise gl.vm.UserError("only the creator may commit this process")
         if process.state != ProcessState.DRAFT.value:
-            raise Exception("only a DRAFT process can be committed")
+            raise gl.vm.UserError("only a DRAFT process can be committed")
+
+        # Partial mitigation for the caller-supplied-`now` trust gap (see
+        # ClaimEngine's identical comment and SECURITY.md "Caller-supplied
+        # time"): monotonic within this process's own lifecycle only, not
+        # verified against real wall-clock time.
+        if int(now) < int(process.created_at):
+            raise gl.vm.UserError(
+                f"now ({now}) precedes this process's own created_at ({process.created_at}) "
+                "- time must be monotonic within a process's lifecycle"
+            )
 
         stored_node_keys = [nk for nk in process.node_ids.split(",") if nk]
         node_map = {nk: self.nodes[f"{key}:{nk}"] for nk in stored_node_keys}
@@ -566,14 +606,14 @@ class ProcessGraph(gl.Contract):
 
         policy_registry = gl.get_contract_at(self.policy_registry_address)
         if not policy_registry.view().is_active(process.policy_id, process.policy_version):
-            raise Exception("policy version was deactivated since this process was created - cannot commit")
+            raise gl.vm.UserError("policy version was deactivated since this process was created - cannot commit")
 
         if len(node_ids) == 0:
-            raise Exception("cannot commit an empty graph")
+            raise gl.vm.UserError("cannot commit an empty graph")
 
         root_key = root_node_id.hex()
         if root_key not in node_map:
-            raise Exception("root_node_id is not a member of this process's graph")
+            raise gl.vm.UserError("root_node_id is not a member of this process's graph")
 
         edge_count = 0
         for nk in node_ids:
@@ -582,19 +622,19 @@ class ProcessGraph(gl.Contract):
             edge_count += len(node_children)
             for child in node_children:
                 if child.hex() not in node_map:
-                    raise Exception(f"node references a nonexistent child: {child.hex()}")
+                    raise gl.vm.UserError(f"node references a nonexistent child: {child.hex()}")
             if node.node_type == NodeType.CLAIM.value and len(node.claim_slot_id) == 0:
-                raise Exception(f"CLAIM node {nk} has no bound claim slot")
+                raise gl.vm.UserError(f"CLAIM node {nk} has no bound claim slot")
 
         if edge_count > int(process.max_graph_edges):
-            raise Exception("graph exceeds policy max_graph_edges")
+            raise gl.vm.UserError("graph exceeds policy max_graph_edges")
 
         if _has_cycle(node_map):
-            raise Exception("graph contains a cycle - must be a DAG")
+            raise gl.vm.UserError("graph contains a cycle - must be a DAG")
 
         depth = _longest_path_from(node_map, root_key)
         if depth > int(process.max_graph_depth):
-            raise Exception("graph exceeds policy max_graph_depth")
+            raise gl.vm.UserError("graph exceeds policy max_graph_depth")
 
         ordered_nodes = tuple(
             GraphNode(
@@ -625,45 +665,50 @@ class ProcessGraph(gl.Contract):
         process_id = _coerce_bytes(process_id)
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         process = self.processes[key]
         if str(gl.message.sender_address) != process.creator:
-            raise Exception("only the creator may cancel a process")
+            raise gl.vm.UserError("only the creator may cancel a process")
         if (process.state, ProcessState.CANCELLED.value) not in _ALLOWED_PROCESS_TRANSITIONS:
-            raise Exception(f"cannot cancel a process in state {process.state!r}")
+            raise gl.vm.UserError(f"cannot cancel a process in state {process.state!r}")
         process.state = ProcessState.CANCELLED.value
 
     def _transition(self, process_id: bytes, expected_from: str, to: str) -> None:
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         process = self.processes[key]
         if str(gl.message.sender_address) != process.creator:
-            raise Exception("only the creator may transition this process")
+            raise gl.vm.UserError("only the creator may transition this process")
         if process.state != expected_from:
-            raise Exception(f"expected state {expected_from!r}, got {process.state!r}")
+            raise gl.vm.UserError(f"expected state {expected_from!r}, got {process.state!r}")
         if (process.state, to) not in _ALLOWED_PROCESS_TRANSITIONS:
-            raise Exception(f"illegal transition {process.state!r} -> {to!r}")
+            raise gl.vm.UserError(f"illegal transition {process.state!r} -> {to!r}")
         process.state = to
 
     @gl.public.write
-    def bind_slot(self, slot_id: bytes, claim_id: bytes) -> str:
-        """Deliberately PERMISSIONLESS - see multi-file build's
-        docstring for the full authority rationale. Content is
-        independently verified below regardless of caller."""
+    def bind_slot(self, slot_id: bytes, claim_id: bytes, now: u64) -> str:
+        """Was deliberately PERMISSIONLESS with immediate resolution --
+        see finding #2 (session 2026-09-14) and the DISPUTE_WINDOW_SECONDS
+        comment above. Still permissionless (content is independently
+        verified below regardless of caller), but a TRUE/FALSE binding no
+        longer resolves the slot immediately -- it opens a dispute window
+        (see finalize_slot). `now` follows the same caller-supplied-time
+        model as the rest of this codebase (SECURITY.md)."""
         slot_id = _coerce_bytes(slot_id)
         claim_id = _coerce_bytes(claim_id)
+        now = u64(int(now))
         slot_key = slot_id.hex()
         if slot_key not in self.slots:
-            raise Exception("unknown slot_id")
+            raise gl.vm.UserError("unknown slot_id")
         slot = self.slots[slot_key]
-        if slot.state != SlotState.OPEN.value:
-            raise Exception(f"slot is not OPEN (state={slot.state!r}) - cannot reassign")
+        if slot.state not in (SlotState.OPEN.value, SlotState.PENDING.value):
+            raise gl.vm.UserError(f"slot is not OPEN or PENDING (state={slot.state!r}) - cannot reassign")
 
         process_key = slot.process_id.hex()
         process = self.processes[process_key]
         if process.state == ProcessState.DRAFT.value:
-            raise Exception("cannot bind claims until the process has been committed")
+            raise gl.vm.UserError("cannot bind claims until the process has been committed")
 
         claim_engine = gl.get_contract_at(self.claim_engine_address)
 
@@ -671,9 +716,9 @@ class ProcessGraph(gl.Contract):
         claim_process_commitment = _coerce_bytes(provenance[0])
         claim_policy_commitment = _coerce_bytes(provenance[1])
         if claim_process_commitment != commit_process(_as_off_chain_process(process), process.schema_version):
-            raise Exception("claim.process_commitment does not match this process")
+            raise gl.vm.UserError("claim.process_commitment does not match this process")
         if claim_policy_commitment != process.policy_commitment:
-            raise Exception("claim.policy_commitment does not match this process's policy")
+            raise gl.vm.UserError("claim.policy_commitment does not match this process's policy")
 
         pred = claim_engine.view().get_predicate_fields(claim_id)
         if (
@@ -686,18 +731,75 @@ class ProcessGraph(gl.Contract):
             or pred[6] != slot.predicate_substring
             or _coerce_bytes(pred[7]) != slot.subject_commitment
         ):
-            raise Exception("claim's predicate/subject does not match this slot's definition - predicate substitution rejected")
+            raise gl.vm.UserError("claim's predicate/subject does not match this slot's definition - predicate substitution rejected")
 
         claim_state = claim_engine.view().get_state(claim_id)
-        slot.current_claim_id = claim_id
 
         if claim_state in (ClaimState.TRUE.value, ClaimState.FALSE.value):
-            slot.state = SlotState.RESOLVED.value
-        elif claim_state == ClaimState.INVALIDATED.value:
+            if slot.state == SlotState.OPEN.value:
+                # First TRUE/FALSE binding on this slot: opens the
+                # dispute window, does not resolve yet.
+                slot.current_claim_id = claim_id
+                slot.state = SlotState.PENDING.value
+                slot.bound_at = now
+                slot.bound_deposit = claim_engine.view().get_deposit_amount(claim_id)
+            elif claim_id == slot.current_claim_id:
+                # Re-affirming the already-pending claim (e.g. to refresh
+                # after a no-op call) -- not a challenge, window unchanged.
+                pass
+            elif int(now) - int(slot.bound_at) >= DISPUTE_WINDOW_SECONDS:
+                raise gl.vm.UserError(
+                    "dispute window has already elapsed for the pending claim - "
+                    "call finalize_slot instead of attempting a late challenge"
+                )
+            else:
+                challenger_deposit = claim_engine.view().get_deposit_amount(claim_id)
+                if int(challenger_deposit) <= int(slot.bound_deposit):
+                    raise gl.vm.UserError(
+                        f"challenger deposit ({challenger_deposit}) does not exceed the "
+                        f"currently pending claim's deposit ({slot.bound_deposit}) - cannot challenge"
+                    )
+                # Bond escalation: challenger displaces the pending claim
+                # and the window resets, same as a fresh binding.
+                slot.current_claim_id = claim_id
+                slot.bound_at = now
+                slot.bound_deposit = challenger_deposit
+        elif claim_state in (ClaimState.INVALIDATED.value, ClaimState.EXPIRED.value):
+            # Found in review (session 2026-09-14): before ClaimEngine's
+            # fix, EXPIRED-via-freshness and human-initiated INVALIDATED
+            # were the same literal string here and could not be told
+            # apart. Both still follow the same allow_revocation_retry
+            # gate for now -- deliberately unchanged behavior, this fix
+            # is about making the two cases distinguishable in claim
+            # state history, not about changing what a policy author's
+            # allow_revocation_retry setting does.
+            slot.current_claim_id = claim_id
             slot.state = SlotState.OPEN.value if process.allow_revocation_retry else SlotState.LOCKED.value
+            slot.bound_at = u64(0)
+            slot.bound_deposit = u256(0)
         else:
+            slot.current_claim_id = claim_id
             slot.state = SlotState.OPEN.value
+            slot.bound_at = u64(0)
+            slot.bound_deposit = u256(0)
 
+        return slot.state
+
+    @gl.public.write
+    def finalize_slot(self, slot_id: bytes, now: u64) -> str:
+        """Permissionless, same rationale as bind_slot: locks in a
+        PENDING slot as RESOLVED once its dispute window has elapsed
+        without being outbid. See DISPUTE_WINDOW_SECONDS."""
+        slot_id = _coerce_bytes(slot_id)
+        slot_key = slot_id.hex()
+        if slot_key not in self.slots:
+            raise gl.vm.UserError("unknown slot_id")
+        slot = self.slots[slot_key]
+        if slot.state != SlotState.PENDING.value:
+            raise gl.vm.UserError(f"slot is not PENDING (state={slot.state!r}) - nothing to finalize")
+        if int(now) - int(slot.bound_at) < DISPUTE_WINDOW_SECONDS:
+            raise gl.vm.UserError("dispute window has not elapsed yet")
+        slot.state = SlotState.RESOLVED.value
         return slot.state
 
     def _evaluate_node(self, process_key: str, node_key: str) -> str:
@@ -707,6 +809,16 @@ class ProcessGraph(gl.Contract):
             slot_key = node.claim_slot_id.hex()
             slot = self.slots[slot_key]
             if slot.state == SlotState.LOCKED.value:
+                return ThreeValued.UNKNOWN.value
+            if slot.state == SlotState.PENDING.value:
+                # Not yet counted: the dispute window (see bind_slot /
+                # finalize_slot) hasn't closed, so this binding could
+                # still be displaced by a larger-deposit challenger.
+                # finalize_process cannot even reach this (see
+                # _collect_open_slots_reachable below), but the
+                # standalone `evaluate` view can be called at any time,
+                # including mid-window -- it must not report a not-yet-
+                # final outcome as if it were settled.
                 return ThreeValued.UNKNOWN.value
             if len(slot.current_claim_id) == 0:
                 return ThreeValued.UNKNOWN.value
@@ -729,17 +841,17 @@ class ProcessGraph(gl.Contract):
         if node.node_type == NodeType.THRESHOLD.value:
             return _threshold(int(node.threshold_k), child_results)
 
-        raise Exception(f"unhandled node_type at evaluation: {node.node_type!r}")
+        raise gl.vm.UserError(f"unhandled node_type at evaluation: {node.node_type!r}")
 
     @gl.public.view
     def evaluate(self, process_id: bytes) -> str:
         process_id = _coerce_bytes(process_id)
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         process = self.processes[key]
         if len(process.root_node_id) == 0:
-            raise Exception("process has not been committed yet")
+            raise gl.vm.UserError("process has not been committed yet")
         return self._evaluate_node(key, process.root_node_id.hex())
 
     def _collect_open_slots_reachable(self, process_key: str, node_key: str, seen: set) -> list:
@@ -750,7 +862,11 @@ class ProcessGraph(gl.Contract):
         open_slots = []
         if node.node_type == NodeType.CLAIM.value:
             slot = self.slots[node.claim_slot_id.hex()]
-            if slot.state == SlotState.OPEN.value:
+            if slot.state in (SlotState.OPEN.value, SlotState.PENDING.value):
+                # PENDING blocks finalization too, not just OPEN (added
+                # alongside PENDING itself, session 2026-09-14) -- a
+                # process must not finalize while a slot's dispute window
+                # is still open, or the window would be meaningless.
                 open_slots.append(slot.slot_id)
         for c in _decode_children(node.children):
             open_slots += self._collect_open_slots_reachable(process_key, c.hex(), seen)
@@ -761,21 +877,30 @@ class ProcessGraph(gl.Contract):
         process_id = _coerce_bytes(process_id)
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         process = self.processes[key]
 
         if process.state == ProcessState.FINALIZED.value:
-            raise Exception("process is already FINALIZED - cannot finalize twice")
+            raise gl.vm.UserError("process is already FINALIZED - cannot finalize twice")
         if process.state == ProcessState.CANCELLED.value:
-            raise Exception("process is CANCELLED - cannot finalize")
+            raise gl.vm.UserError("process is CANCELLED - cannot finalize")
         if process.state not in (ProcessState.COMMITTED.value, ProcessState.ACTIVE.value, ProcessState.RESOLVING.value):
-            raise Exception(f"process is in state {process.state!r} - cannot finalize")
+            raise gl.vm.UserError(f"process is in state {process.state!r} - cannot finalize")
         if len(process.root_node_id) == 0:
-            raise Exception("process has no root_node_id - cannot finalize")
+            raise gl.vm.UserError("process has no root_node_id - cannot finalize")
+
+        # Same monotonicity mitigation as commit_process -- see the
+        # comment there. root_node_id is only ever set by commit_process,
+        # so process.committed_at is guaranteed already populated here.
+        if int(now) < int(process.committed_at):
+            raise gl.vm.UserError(
+                f"now ({now}) precedes this process's own committed_at ({process.committed_at}) "
+                "- time must be monotonic within a process's lifecycle"
+            )
 
         open_slots = self._collect_open_slots_reachable(key, process.root_node_id.hex(), set())
         if len(open_slots) > 0:
-            raise Exception(
+            raise gl.vm.UserError(
                 f"cannot finalize: {len(open_slots)} claim slot(s) reachable from root are still OPEN"
             )
 
@@ -793,10 +918,10 @@ class ProcessGraph(gl.Contract):
         process_id = _coerce_bytes(process_id)
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         process = self.processes[key]
         if process.state == ProcessState.DRAFT.value:
-            raise Exception("process has not been committed yet - no stable commitment exists")
+            raise gl.vm.UserError("process has not been committed yet - no stable commitment exists")
         return commit_process(_as_off_chain_process(process), process.schema_version).hex()
 
     @gl.public.view
@@ -804,7 +929,7 @@ class ProcessGraph(gl.Contract):
         process_id = _coerce_bytes(process_id)
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         return self.processes[key].state
 
     @gl.public.view
@@ -812,10 +937,10 @@ class ProcessGraph(gl.Contract):
         process_id = _coerce_bytes(process_id)
         key = process_id.hex()
         if key not in self.processes:
-            raise Exception("unknown process_id")
+            raise gl.vm.UserError("unknown process_id")
         process = self.processes[key]
         if process.state != ProcessState.FINALIZED.value:
-            raise Exception("process is not FINALIZED yet")
+            raise gl.vm.UserError("process is not FINALIZED yet")
         return process.final_result
 
     @gl.public.view
@@ -823,5 +948,5 @@ class ProcessGraph(gl.Contract):
         slot_id = _coerce_bytes(slot_id)
         slot_key = slot_id.hex()
         if slot_key not in self.slots:
-            raise Exception("unknown slot_id")
+            raise gl.vm.UserError("unknown slot_id")
         return self.slots[slot_key].state
