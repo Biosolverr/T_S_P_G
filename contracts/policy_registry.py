@@ -430,3 +430,4 @@ class PolicyRegistry(gl.Contract):
         if key not in self.policies or version not in self.policies[key]:
             raise gl.vm.UserError("unknown policy version")
         return self.policies[key][version].min_deposit
+
