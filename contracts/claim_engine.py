@@ -498,24 +498,34 @@ class ClaimEngine(gl.Contract):
         expected_policy_commitment = _coerce_bytes(expected_policy_commitment)
         subject_commitment = _coerce_bytes(subject_commitment)
         expected_evidence_commitment = _coerce_bytes(expected_evidence_commitment)
-        PredicateType(predicate_type)
+        sender_str = str(gl.message.sender_address)
+        refund_amount = u256(int(gl.message.value))
+        try:
+            PredicateType(predicate_type)
+        except ValueError:
+            self._credit_withdrawable(sender_str, refund_amount)
+            return f"REJECTED: unknown predicate_type {predicate_type!r}"
 
         # Added (session 2026-09-14, finding #8): _require() only checked
         # that quantity fields were supplied (not None), never that they
         # were sane -- "at least -500 GRAMS" was accepted silently.
         if predicate_type in (PredicateType.QUANTITY_AT_LEAST.value, PredicateType.QUANTITY_EQUALS.value):
             if int(predicate_value) < 0:
-                raise gl.vm.UserError(f"predicate_value must be >= 0 for {predicate_type!r}, got {predicate_value}")
+                self._credit_withdrawable(sender_str, refund_amount)
+                return "REJECTED: " + (f"predicate_value must be >= 0 for {predicate_type!r}, got {predicate_value}")
 
         policy_registry = gl.get_contract_at(self.policy_registry_address)
         if not policy_registry.view().verify_commitment(policy_id, policy_version, expected_policy_commitment):
-            raise gl.vm.UserError("policy_commitment does not match PolicyRegistry's committed content")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + ("policy_commitment does not match PolicyRegistry's committed content")
         if not policy_registry.view().is_active(policy_id, policy_version):
-            raise gl.vm.UserError("policy version is not active - cannot register new claims against it")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + ("policy version is not active - cannot register new claims against it")
 
         min_deposit = policy_registry.view().get_min_deposit(policy_id, policy_version)
         if gl.message.value < min_deposit:
-            raise gl.vm.UserError(f"deposit too small: sent {gl.message.value}, policy requires >= {min_deposit} (spec S38)")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + (f"deposit too small: sent {gl.message.value}, policy requires >= {min_deposit} (spec S38)")
 
         # Added (session 2026-09-14, finding #3): predicate_rules was
         # stored and hashed by PolicyRegistry from the beginning but
@@ -526,13 +536,13 @@ class ClaimEngine(gl.Contract):
         # specific policy's whitelist.
         allowed_predicate_rules = policy_registry.view().get_predicate_rules(policy_id, policy_version)
         if predicate_type not in allowed_predicate_rules:
-            raise gl.vm.UserError(
-                f"predicate_type {predicate_type!r} is not in this policy's predicate_rules {allowed_predicate_rules!r}"
-            )
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + (f"predicate_type {predicate_type!r} is not in this policy's predicate_rules {allowed_predicate_rules!r}")
 
         evidence_registry = gl.get_contract_at(self.evidence_registry_address)
         if not evidence_registry.view().verify_commitment(evidence_id, expected_evidence_commitment, schema_version):
-            raise gl.vm.UserError("evidence_commitment does not match EvidenceRegistry's committed content")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + ("evidence_commitment does not match EvidenceRegistry's committed content")
 
         limits = policy_registry.view().get_graph_limits(policy_id, policy_version)
         max_claims_per_process = limits[3]
@@ -541,7 +551,8 @@ class ClaimEngine(gl.Contract):
 
         artifact_size = evidence_registry.view().get_artifact_size(evidence_id)
         if int(artifact_size) > int(max_evidence_size):
-            raise gl.vm.UserError(f"evidence artifact_size {artifact_size} exceeds policy max_evidence_size {max_evidence_size}")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + (f"evidence artifact_size {artifact_size} exceeds policy max_evidence_size {max_evidence_size}")
 
         # Partial mitigation for the caller-supplied-`now` trust gap (see
         # SECURITY.md "Caller-supplied time" and the comment in
@@ -553,10 +564,9 @@ class ClaimEngine(gl.Contract):
         # contract already has independently, via EvidenceRegistry.
         evidence_submitted_at = evidence_registry.view().get_submitted_at(evidence_id)
         if int(now) < int(evidence_submitted_at):
-            raise gl.vm.UserError(
-                f"now ({now}) precedes the referenced evidence's own submitted_at "
-                f"({evidence_submitted_at}) - a claim cannot assert evidence from the future"
-            )
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + (f"now ({now}) precedes the referenced evidence's own submitted_at "
+                f"({evidence_submitted_at}) - a claim cannot assert evidence from the future")
 
         predicate_size = (
             len(predicate_unit.encode("utf-8"))
@@ -566,17 +576,21 @@ class ClaimEngine(gl.Contract):
             + len(subject_description.encode("utf-8"))
         )
         if predicate_size > int(max_predicate_size):
-            raise gl.vm.UserError(f"predicate parameter size {predicate_size} exceeds policy max_predicate_size {max_predicate_size}")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + (f"predicate parameter size {predicate_size} exceeds policy max_predicate_size {max_predicate_size}")
 
         process_key = process_commitment.hex()
         current_count = self.claims_per_process[process_key] if process_key in self.claims_per_process else u32(0)
         if int(current_count) + 1 > int(max_claims_per_process):
-            raise gl.vm.UserError(f"registering this claim would exceed policy max_claims_per_process ({max_claims_per_process}) for this process - spec S39")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + (f"registering this claim would exceed policy max_claims_per_process ({max_claims_per_process}) for this process - spec S39")
 
         if scope not in ("PROCESS", "POLICY", "GLOBAL"):
-            raise gl.vm.UserError(f"invalid scope: {scope!r}")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + (f"invalid scope: {scope!r}")
         if scope != "PROCESS":
-            raise gl.vm.UserError("POLICY/GLOBAL claim scope is not implemented in this MVP - see SECURITY.md")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + ("POLICY/GLOBAL claim scope is not implemented in this MVP - see SECURITY.md")
 
         asserted_at = now
 
@@ -611,7 +625,8 @@ class ClaimEngine(gl.Contract):
         claim_key = claim_hash.hex()
 
         if claim_key in self.claims:
-            raise gl.vm.UserError("claim_id collision on registration - refusing to overwrite")
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: " + ("claim_id collision on registration - refusing to overwrite")
 
         self.claims[claim_key] = stored
         self.claims_per_process[process_key] = u32(int(current_count) + 1)
@@ -813,10 +828,46 @@ class ClaimEngine(gl.Contract):
             self.protocol_sink = u256(int(self.protocol_sink) + int(stored.deposit_amount))
             stored.deposit_settled = True
 
+    def _credit_withdrawable(self, address: str, amount: u256) -> None:
+        """Credit `amount` to `address`'s withdrawable balance directly,
+        with no linked claim record. Used by register_claim's reject
+        paths: a payable call's `value` is delivered before this
+        contract's own validation runs (see SECURITY.md, "Value delivery
+        and rejected payable calls"), so a rejection cannot simply
+        `raise` without stranding that value -- it must `return` a
+        rejection marker after recording the refund here, since only a
+        non-reverting execution actually commits any state change,
+        including this credit."""
+        if int(amount) == 0:
+            return
+        current = self.withdrawable[address] if address in self.withdrawable else u256(0)
+        self.withdrawable[address] = u256(int(current) + int(amount))
+
     def _send_native(self, to_address: str, amount: u256) -> None:
-        """Call-site unverified against a live GenVM node - confirm
-        emit_transfer()'s real signature in GenLayer Studio."""
-        gl.get_contract_at(bytes.fromhex(to_address)).emit_transfer(amount)
+        """Call-site UNVERIFIED against a live GenVM node.
+
+        Two confirmed bugs fixed here so far, found live on Studio:
+        1. `to_address` is `str(gl.message.sender_address)`, which includes
+           a "0x" prefix that `bytes.fromhex` rejects. Stripped it.
+        2. `gl.get_contract_at` requires an `Address` object, not raw
+           `bytes` (`TypeError: address expected` otherwise). Wrapped it.
+
+        Still unverified: community reports from other GenLayer projects
+        say this call form (`gl.get_contract_at(...).emit_transfer(...)`)
+        returns FINISHED_WITH_RETURN and moves zero wei against a plain
+        wallet (EOA) address, with no error at all, and that a wallet
+        payout needs a `@gl.evm.contract_interface` declaration instead.
+        That symbol does not exist in this pinned build (`gl.evm` ->
+        AttributeError, breaks schema loading entirely -- do not
+        reintroduce it without confirming the correct namespace for this
+        exact py-genlayer version first). Until this call is confirmed to
+        actually move funds against a real EOA on this build, treat
+        withdraw() and withdraw_protocol_sink() as unverified: a clean
+        SUCCESS here does not by itself prove the recipient's balance
+        changed.
+        """
+        hex_part = to_address[2:] if to_address.startswith(("0x", "0X")) else to_address
+        gl.get_contract_at(Address(bytes.fromhex(hex_part))).emit_transfer(value=amount)
 
     @gl.public.write
     def withdraw(self) -> u256:
@@ -842,6 +893,12 @@ class ClaimEngine(gl.Contract):
     @gl.public.view
     def get_withdrawable(self, address: str) -> u256:
         return self.withdrawable[address] if address in self.withdrawable else u256(0)
+
+    @gl.public.view
+    def get_registry_addresses(self) -> tuple[str, str]:
+        """Diagnostic getter: what this deployment's constructor was
+        actually given. Returns (policy_registry_address, evidence_registry_address)."""
+        return (str(self.policy_registry_address), str(self.evidence_registry_address))
 
     @gl.public.view
     def get_state(self, claim_id: bytes) -> str:
