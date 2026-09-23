@@ -9,7 +9,7 @@ surface is exercisable here.
 
 Run with:
     pip install genlayer-test
-    pytest tests/test_evidence_registry.py -v
+    pytest test/test_evidence_registry.py -v
 """
 
 CONTRACT_PATH = "contracts/evidense_registry.py"
