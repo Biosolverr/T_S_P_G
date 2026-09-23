@@ -17,12 +17,12 @@ exercised.
 
 The actual graph semantics (AND/OR/NOT/THRESHOLD evaluation, cycle
 detection, depth/edge limits, bind_slot's cross-contract predicate
-verification) are verified live against GenLayer Studio instead -- see
-TEST_RESULTS.md.
+verification and dispute-window bond escalation) are verified live
+against GenLayer Studio instead -- see TEST_RESULTS.md.
 
 Run with:
     pip install genlayer-test
-    pytest tests/test_process_graph.py -v
+    pytest test/test_process_graph.py -v
 """
 
 CONTRACT_PATH = "contracts/process_graph.py"
@@ -128,10 +128,9 @@ def test_bind_slot_unknown_slot_reverts(direct_vm, direct_deploy):
 
 
 def test_finalize_slot_unknown_slot_reverts(direct_vm, direct_deploy):
-    """finalize_slot (added alongside the dispute-window fix for finding
-    #2, session 2026-09-14) -- unreachable past this guard for the same
-    reason as everything else in this file: no slot can ever exist in
-    Direct Mode."""
+    """finalize_slot (the dispute-window counterpart to bind_slot) --
+    unreachable past this guard for the same reason as everything else
+    in this file: no slot can ever exist in Direct Mode."""
     contract, *_ = _deploy_default(direct_deploy)
     with direct_vm.expect_revert("unknown slot_id"):
         contract.finalize_slot(b"\x99" * 32, 1_788_684_041)
