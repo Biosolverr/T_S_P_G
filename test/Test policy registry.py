@@ -12,7 +12,7 @@ file is NOT limited to guard-clause/constructor coverage.
 
 Run with:
     pip install genlayer-test
-    pytest tests/test_policy_registry.py -v
+    pytest test/test_policy_registry.py -v
 """
 
 CONTRACT_PATH = "contracts/policy_registry.py"
@@ -158,9 +158,11 @@ def test_unknown_predicate_type_rejected(direct_vm, direct_deploy):
 
 
 def test_unknown_freshness_on_expiry_rejected_when_freshness_enabled(direct_vm, direct_deploy):
-    """FreshnessOnExpiry is only validated when evidence_max_age_seconds > 0
-    (spec S21 -- see the enum's docstring: it must never be able to
-    resolve to FALSE)."""
+    """`evidence_freshness_on_expiry` must always resolve to a real
+    FreshnessOnExpiry value -- see the enum's docstring: it must never be
+    able to resolve to FALSE. Exercised here with freshness enabled
+    (evidence_max_age_seconds > 0); see the next test for the
+    freshness-disabled case, which is validated identically."""
     contract = _deploy(direct_deploy)
     alice = _addr("alice")
     with direct_vm.prank(alice):
@@ -175,11 +177,10 @@ def test_unknown_freshness_on_expiry_rejected_when_freshness_enabled(direct_vm, 
 def test_unknown_freshness_rejected_even_when_freshness_disabled(direct_vm, direct_deploy):
     """Regression test: `evidence_freshness_on_expiry` is part of the
     hashed PolicyContent regardless of whether evidence_max_age_seconds
-    is 0, so it must be validated unconditionally, with a clean
-    gl.vm.UserError-style message -- not left to fail a few lines later
-    as a raw, uncaught ValueError out of `_to_content`. (Found via this
-    test originally failing against the unfixed contract; see the
-    comment above the fix in register_policy.)"""
+    is 0, so `register_policy` validates it unconditionally, with a
+    clean gl.vm.UserError-style message -- not left to fail a few lines
+    later as a raw, uncaught ValueError out of `_to_content`. (See the
+    comment above the validation call in register_policy.)"""
     contract = _deploy(direct_deploy)
     alice = _addr("alice")
     with direct_vm.prank(alice):
@@ -233,7 +234,6 @@ def test_deactivating_does_not_change_the_hash(direct_vm, direct_deploy):
     contract = _deploy(direct_deploy)
     alice = _addr("alice")
     with direct_vm.prank(alice):
-        before = contract.get_policy_hash(b"\x01" * 32, 1) if False else None
         h = _register(contract)
         contract.set_active(b"\x01" * 32, 1, False)
     assert contract.get_policy_hash(b"\x01" * 32, 1) == h
@@ -278,6 +278,19 @@ def test_get_min_unique_validators_matches_input(direct_vm, direct_deploy):
     assert contract.get_min_unique_validators(b"\x01" * 32, 1) == 7
 
 
+def test_get_predicate_rules_matches_input(direct_vm, direct_deploy):
+    """get_predicate_rules was added so ClaimEngine.register_claim could
+    actually enforce a policy's predicate_rules whitelist (see the
+    comment above the method in policy_registry.py, and TESTING.md's
+    cross-field constraints) -- it was previously stored and hashed but
+    never exposed via any getter."""
+    contract = _deploy(direct_deploy)
+    alice = _addr("alice")
+    with direct_vm.prank(alice):
+        _register(contract, predicate_rules=["QuantityAtLeast", "DateBefore"])
+    assert contract.get_predicate_rules(b"\x01" * 32, 1) == ["QuantityAtLeast", "DateBefore"]
+
+
 def test_get_graph_limits_matches_input(direct_vm, direct_deploy):
     contract = _deploy(direct_deploy)
     alice = _addr("alice")
@@ -318,6 +331,7 @@ def test_views_revert_on_unknown_version(direct_vm, direct_deploy):
     for method, args in [
         ("get_policy_hash", (b"\x99" * 32, 1)),
         ("get_min_unique_validators", (b"\x99" * 32, 1)),
+        ("get_predicate_rules", (b"\x99" * 32, 1)),
         ("get_graph_limits", (b"\x99" * 32, 1)),
         ("get_allow_revocation_retry", (b"\x99" * 32, 1)),
         ("get_freshness", (b"\x99" * 32, 1)),
