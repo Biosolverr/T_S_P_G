@@ -15,8 +15,10 @@ Direct Mode.
 What IS verified here, for real: constructor behaviour and address
 coercion, and every guard clause that fires BEFORE any cross-contract
 call -- which turns out to be all of `invalidate_claim`, `expire_claim`,
-`withdraw`, `withdraw_protocol_sink`, every view, and the
-`PredicateType` / `scope` validation at the top of `register_claim`.
+`withdraw`, `withdraw_protocol_sink`, every view (including
+`get_registry_addresses`, a pure constructor-echo with no storage
+lookup at all), and the `PredicateType` / quantity-range validation at
+the top of `register_claim`.
 
 Cross-contract-dependent behavior (a real register_claim + adjudicate_claim
 end to end, including the strict_eq / VERDICT / HASH_MISMATCH /
@@ -25,7 +27,7 @@ see TEST_RESULTS.md.
 
 Run with:
     pip install genlayer-test
-    pytest tests/test_claim_engine.py -v
+    pytest test/test_claim_engine.py -v
 """
 
 CONTRACT_PATH = "contracts/claim_engine.py"
@@ -140,6 +142,17 @@ def test_constructor_accepts_addresses_as_plain_int(direct_vm, direct_deploy):
     assert contract is not None
 
 
+def test_get_registry_addresses_matches_constructor(direct_vm, direct_deploy):
+    """Diagnostic getter added so a deployment's actual wiring can be
+    checked without re-reading constructor args from deploy history --
+    pure echo of constructor state, no storage lookup, so it is fully
+    exercisable in Direct Mode."""
+    contract, policy_addr, evidence_addr, _admin = _deploy_default(direct_deploy)
+    policy_registry_address, evidence_registry_address = contract.get_registry_addresses()
+    assert policy_registry_address == str(policy_addr)
+    assert evidence_registry_address == str(evidence_addr)
+
+
 # --------------------------------------------------------------------- #
 # register_claim: validation that happens BEFORE any cross-contract call
 # --------------------------------------------------------------------- #
@@ -158,15 +171,24 @@ def test_register_claim_rejects_unknown_predicate_type_before_any_cross_contract
 
 
 def test_register_claim_rejects_negative_quantity_before_any_cross_contract_call(direct_vm, direct_deploy):
-    """Regression test for finding #8 (session 2026-09-14): the
-    predicate_value >= 0 check for QuantityAtLeast/QuantityEquals sits
-    right after the PredicateType check, also before any cross-contract
-    call, so it's exercisable here too."""
+    """The predicate_value >= 0 check for QuantityAtLeast/QuantityEquals
+    sits right after the PredicateType check, also before any
+    cross-contract call, so it's exercisable here too."""
     contract, *_ = _deploy_default(direct_deploy)
     alice = _addr("alice")
     with direct_vm.prank(alice):
         with direct_vm.expect_revert("predicate_value must be >= 0"):
             _register_claim(contract, predicate_type="QuantityAtLeast", predicate_value=-500)
+
+
+def test_register_claim_rejects_negative_quantity_for_quantity_equals(direct_vm, direct_deploy):
+    """Same guard, other quantity predicate type -- both QuantityAtLeast
+    and QuantityEquals share the >= 0 check."""
+    contract, *_ = _deploy_default(direct_deploy)
+    alice = _addr("alice")
+    with direct_vm.prank(alice):
+        with direct_vm.expect_revert("predicate_value must be >= 0"):
+            _register_claim(contract, predicate_type="QuantityEquals", predicate_value=-1)
 
 
 # --------------------------------------------------------------------- #
@@ -251,8 +273,9 @@ def test_get_predicate_fields_unknown_claim_reverts(direct_vm, direct_deploy):
 
 
 def test_get_deposit_amount_unknown_claim_reverts(direct_vm, direct_deploy):
-    """get_deposit_amount was added for ProcessGraph's dispute-window
-    bond comparison (finding #2, session 2026-09-14)."""
+    """get_deposit_amount is needed by ProcessGraph.bind_slot's bond
+    escalation to compare a challenger's claim deposit against the
+    currently pending claim's deposit -- see TESTING.md."""
     contract, *_ = _deploy_default(direct_deploy)
     with direct_vm.expect_revert("unknown claim_id"):
         contract.get_deposit_amount(b"\x99" * 32)
