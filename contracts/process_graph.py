@@ -343,6 +343,46 @@ def _decode_children(s: str) -> list[bytes]:
     return [bytes.fromhex(x) for x in s.split(",") if x]
 
 
+# =====================================================================
+# Consensus-backed transaction time (replaces every caller-supplied `now`).
+# =====================================================================
+# gl.message_raw["datetime"] is the transaction's datetime, fixed by the
+# consensus round and identical for leader and validators -- no caller can
+# choose it. Format: fixed-width ISO-8601 UTC, e.g. "2026-09-27T09:14:14.081651Z".
+# Parsed with integer math because the `datetime` module is not usable
+# inside contracts. Accessed lazily (inside a function, never at import
+# time) so that a runtime lacking it fails this call, not schema loading.
+
+def _days_from_civil(y: int, m: int, d: int) -> int:
+    y -= 1 if m <= 2 else 0
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _tx_now_or_none():
+    try:
+        s = str(gl.message_raw["datetime"])
+        if len(s) < 19 or s[4] != "-" or s[7] != "-" or s[10] not in ("T", " ") or s[13] != ":" or s[16] != ":":
+            return None
+        y, mo, d = int(s[0:4]), int(s[5:7]), int(s[8:10])
+        hh, mi, ss = int(s[11:13]), int(s[14:16]), int(s[17:19])
+        if not (1 <= mo <= 12 and 1 <= d <= 31 and hh < 24 and mi < 60 and ss < 61):
+            return None
+        return _days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss
+    except Exception:
+        return None
+
+
+def _tx_now() -> int:
+    v = _tx_now_or_none()
+    if v is None:
+        raise gl.vm.UserError("consensus transaction time (gl.message_raw['datetime']) is unavailable in this runtime")
+    return v
+
+
 def _coerce_address(val) -> Address:
     """Defensive coercion for any Address-typed argument coming in from a
     public write/constructor call.
@@ -406,6 +446,7 @@ class ProcessGraph(gl.Contract):
     processes: TreeMap[str, StoredProcess]
     nodes: TreeMap[str, StoredGraphNode]  # keyed by "process_key:node_key" -- flat, no nested TreeMap construction needed
     slots: TreeMap[str, StoredClaimSlot]
+    claim_slots: TreeMap[str, str]  # claim_id hex -> slot_id hex it was bound to as a TRUE/FALSE candidate
 
     def __init__(self, policy_registry_address: Address, claim_engine_address: Address):
         self.policy_registry_address = _coerce_address(policy_registry_address)
@@ -419,7 +460,6 @@ class ProcessGraph(gl.Contract):
         policy_version: u32,
         expected_policy_commitment: bytes,
         schema_version: str,
-        now: u64,
     ) -> None:
         process_id = _coerce_bytes(process_id)
         policy_id = _coerce_bytes(policy_id)
@@ -437,7 +477,7 @@ class ProcessGraph(gl.Contract):
         limits = policy_registry.view().get_graph_limits(policy_id, policy_version)
         allow_revocation_retry = policy_registry.view().get_allow_revocation_retry(policy_id, policy_version)
 
-        now = int(now)
+        now = _tx_now()  # consensus time -- not caller-controlled
 
         record = StoredProcess(
             process_id=process_id,
@@ -578,7 +618,7 @@ class ProcessGraph(gl.Contract):
         node.claim_slot_id = slot_id
 
     @gl.public.write
-    def commit_process(self, process_id: bytes, root_node_id: bytes, now: u64) -> str:
+    def commit_process(self, process_id: bytes, root_node_id: bytes) -> str:
         process_id = _coerce_bytes(process_id)
         root_node_id = _coerce_bytes(root_node_id)
         key = process_id.hex()
@@ -590,15 +630,7 @@ class ProcessGraph(gl.Contract):
         if process.state != ProcessState.DRAFT.value:
             raise gl.vm.UserError("only a DRAFT process can be committed")
 
-        # Partial mitigation for the caller-supplied-`now` trust gap (see
-        # ClaimEngine's identical comment and SECURITY.md "Caller-supplied
-        # time"): monotonic within this process's own lifecycle only, not
-        # verified against real wall-clock time.
-        if int(now) < int(process.created_at):
-            raise gl.vm.UserError(
-                f"now ({now}) precedes this process's own created_at ({process.created_at}) "
-                "- time must be monotonic within a process's lifecycle"
-            )
+        now = _tx_now()  # consensus time -- not caller-controlled
 
         stored_node_keys = [nk for nk in process.node_ids.split(",") if nk]
         node_map = {nk: self.nodes[f"{key}:{nk}"] for nk in stored_node_keys}
@@ -687,17 +719,18 @@ class ProcessGraph(gl.Contract):
         process.state = to
 
     @gl.public.write
-    def bind_slot(self, slot_id: bytes, claim_id: bytes, now: u64) -> str:
-        """Was deliberately PERMISSIONLESS with immediate resolution --
-        see finding #2 (session 2026-09-14) and the DISPUTE_WINDOW_SECONDS
-        comment above. Still permissionless (content is independently
-        verified below regardless of caller), but a TRUE/FALSE binding no
-        longer resolves the slot immediately -- it opens a dispute window
-        (see finalize_slot). `now` follows the same caller-supplied-time
-        model as the rest of this codebase (SECURITY.md)."""
+    def bind_slot(self, slot_id: bytes, claim_id: bytes) -> str:
+        """Permissionless (content is independently verified below
+        regardless of caller). A TRUE/FALSE binding does not resolve the
+        slot immediately -- it opens a dispute window (see finalize_slot).
+        Time is the consensus transaction time, not a caller argument.
+        A binding or challenge is only accepted from a claim whose deposit
+        is still HELD (get_bond) and whose evidence is still eligible; while
+        it is the pending candidate its deposit is locked in ClaimEngine
+        (is_claim_locked / release_deposit)."""
         slot_id = _coerce_bytes(slot_id)
         claim_id = _coerce_bytes(claim_id)
-        now = u64(int(now))
+        now = u64(_tx_now())
         slot_key = slot_id.hex()
         if slot_key not in self.slots:
             raise gl.vm.UserError("unknown slot_id")
@@ -736,13 +769,36 @@ class ProcessGraph(gl.Contract):
         claim_state = claim_engine.view().get_state(claim_id)
 
         if claim_state in (ClaimState.TRUE.value, ClaimState.FALSE.value):
+            claim_key = claim_id.hex()
+            if not claim_engine.view().is_evidence_eligible(claim_id):
+                raise gl.vm.UserError("claim's evidence is no longer in an eligible state (REVOKED or INVALID)")
+
+            # A claim's bond may back only one slot at a time.
+            if claim_key in self.claim_slots and self.claim_slots[claim_key] != slot_key:
+                other = self.slots[self.claim_slots[claim_key]]
+                if other.current_claim_id == claim_id and other.state in (SlotState.PENDING.value, SlotState.RESOLVED.value):
+                    raise gl.vm.UserError("this claim is already bound to another slot")
+
+            # The bond is the deposit ClaimEngine is STILL HOLDING for this
+            # claim. Once released (refunded) it is zero, so a refunded
+            # deposit can never be counted as a bond.
+            bond = claim_engine.view().get_bond(claim_id)
+            policy_registry = gl.get_contract_at(self.policy_registry_address)
+            min_deposit = policy_registry.view().get_min_deposit(process.policy_id, process.policy_version)
+            if int(bond) < int(min_deposit):
+                raise gl.vm.UserError(
+                    f"claim's held bond ({bond}) is below the policy's min_deposit ({min_deposit}) - "
+                    "its deposit was released or never held"
+                )
+
             if slot.state == SlotState.OPEN.value:
                 # First TRUE/FALSE binding on this slot: opens the
                 # dispute window, does not resolve yet.
                 slot.current_claim_id = claim_id
                 slot.state = SlotState.PENDING.value
                 slot.bound_at = now
-                slot.bound_deposit = claim_engine.view().get_deposit_amount(claim_id)
+                slot.bound_deposit = bond
+                self.claim_slots[claim_key] = slot_key
             elif claim_id == slot.current_claim_id:
                 # Re-affirming the already-pending claim (e.g. to refresh
                 # after a no-op call) -- not a challenge, window unchanged.
@@ -753,7 +809,7 @@ class ProcessGraph(gl.Contract):
                     "call finalize_slot instead of attempting a late challenge"
                 )
             else:
-                challenger_deposit = claim_engine.view().get_deposit_amount(claim_id)
+                challenger_deposit = bond
                 if int(challenger_deposit) <= int(slot.bound_deposit):
                     raise gl.vm.UserError(
                         f"challenger deposit ({challenger_deposit}) does not exceed the "
@@ -761,9 +817,12 @@ class ProcessGraph(gl.Contract):
                     )
                 # Bond escalation: challenger displaces the pending claim
                 # and the window resets, same as a fresh binding.
+                # The displaced claim stops being locked (it is no longer
+                # the pending candidate) and may release its deposit.
                 slot.current_claim_id = claim_id
                 slot.bound_at = now
                 slot.bound_deposit = challenger_deposit
+                self.claim_slots[claim_key] = slot_key
         elif claim_state in (ClaimState.INVALIDATED.value, ClaimState.EXPIRED.value):
             # Found in review (session 2026-09-14): before ClaimEngine's
             # fix, EXPIRED-via-freshness and human-initiated INVALIDATED
@@ -786,10 +845,14 @@ class ProcessGraph(gl.Contract):
         return slot.state
 
     @gl.public.write
-    def finalize_slot(self, slot_id: bytes, now: u64) -> str:
+    def finalize_slot(self, slot_id: bytes) -> str:
         """Permissionless, same rationale as bind_slot: locks in a
         PENDING slot as RESOLVED once its dispute window has elapsed
-        without being outbid. See DISPUTE_WINDOW_SECONDS."""
+        without being outbid. Window length is measured against consensus
+        transaction time. If the pending claim's evidence has been
+        REVOKED/INVALIDATED in the meantime the slot is NOT resolved on it:
+        it reopens (or locks, per the policy's allow_revocation_retry) and
+        that claim's deposit becomes releasable. See DISPUTE_WINDOW_SECONDS."""
         slot_id = _coerce_bytes(slot_id)
         slot_key = slot_id.hex()
         if slot_key not in self.slots:
@@ -797,10 +860,31 @@ class ProcessGraph(gl.Contract):
         slot = self.slots[slot_key]
         if slot.state != SlotState.PENDING.value:
             raise gl.vm.UserError(f"slot is not PENDING (state={slot.state!r}) - nothing to finalize")
-        if int(now) - int(slot.bound_at) < DISPUTE_WINDOW_SECONDS:
+        if _tx_now() - int(slot.bound_at) < DISPUTE_WINDOW_SECONDS:
             raise gl.vm.UserError("dispute window has not elapsed yet")
+
+        claim_engine = gl.get_contract_at(self.claim_engine_address)
+        if not claim_engine.view().is_evidence_eligible(slot.current_claim_id):
+            process = self.processes[slot.process_id.hex()]
+            slot.state = SlotState.OPEN.value if process.allow_revocation_retry else SlotState.LOCKED.value
+            slot.bound_at = u64(0)
+            slot.bound_deposit = u256(0)
+            return slot.state
+
         slot.state = SlotState.RESOLVED.value
         return slot.state
+
+    @gl.public.view
+    def is_claim_locked(self, claim_id: bytes) -> bool:
+        """True while this claim is the pending candidate of a slot whose
+        dispute window is unresolved -- i.e. while its deposit is counted
+        as a bond. ClaimEngine.release_deposit refuses while this is True."""
+        claim_id = _coerce_bytes(claim_id)
+        claim_key = claim_id.hex()
+        if claim_key not in self.claim_slots:
+            return False
+        slot = self.slots[self.claim_slots[claim_key]]
+        return slot.state == SlotState.PENDING.value and slot.current_claim_id == claim_id
 
     def _evaluate_node(self, process_key: str, node_key: str) -> str:
         node = self.nodes[f"{process_key}:{node_key}"]
@@ -873,7 +957,7 @@ class ProcessGraph(gl.Contract):
         return open_slots
 
     @gl.public.write
-    def finalize_process(self, process_id: bytes, now: u64) -> str:
+    def finalize_process(self, process_id: bytes) -> str:
         process_id = _coerce_bytes(process_id)
         key = process_id.hex()
         if key not in self.processes:
@@ -889,14 +973,7 @@ class ProcessGraph(gl.Contract):
         if len(process.root_node_id) == 0:
             raise gl.vm.UserError("process has no root_node_id - cannot finalize")
 
-        # Same monotonicity mitigation as commit_process -- see the
-        # comment there. root_node_id is only ever set by commit_process,
-        # so process.committed_at is guaranteed already populated here.
-        if int(now) < int(process.committed_at):
-            raise gl.vm.UserError(
-                f"now ({now}) precedes this process's own committed_at ({process.committed_at}) "
-                "- time must be monotonic within a process's lifecycle"
-            )
+        now = _tx_now()  # consensus time -- not caller-controlled
 
         open_slots = self._collect_open_slots_reachable(key, process.root_node_id.hex(), set())
         if len(open_slots) > 0:
