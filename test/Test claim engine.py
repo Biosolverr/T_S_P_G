@@ -91,7 +91,6 @@ REGISTER_CLAIM_ARGS = dict(
     expected_evidence_commitment=b"\x05" * 32,
     schema_version="1.0.0",
     scope="PROCESS",
-    now=1_788_684_041,
 )
 
 
@@ -116,7 +115,6 @@ def _register_claim(contract, **overrides):
         args["expected_evidence_commitment"],
         args["schema_version"],
         args["scope"],
-        args["now"],
     )
 
 
@@ -166,8 +164,11 @@ def test_register_claim_rejects_unknown_predicate_type_before_any_cross_contract
     contract, *_ = _deploy_default(direct_deploy)
     alice = _addr("alice")
     with direct_vm.prank(alice):
-        with direct_vm.expect_revert():
-            _register_claim(contract, predicate_type="NotARealPredicate")
+        # register_claim no longer raises for business-logic rejections
+        # (SECURITY.md, "Value delivery and rejected payable calls"): it
+        # returns a "REJECTED: ..." marker after crediting the attached value.
+        result = _register_claim(contract, predicate_type="NotARealPredicate")
+    assert str(result).startswith("REJECTED: unknown predicate_type")
 
 
 def test_register_claim_rejects_negative_quantity_before_any_cross_contract_call(direct_vm, direct_deploy):
@@ -177,8 +178,8 @@ def test_register_claim_rejects_negative_quantity_before_any_cross_contract_call
     contract, *_ = _deploy_default(direct_deploy)
     alice = _addr("alice")
     with direct_vm.prank(alice):
-        with direct_vm.expect_revert("predicate_value must be >= 0"):
-            _register_claim(contract, predicate_type="QuantityAtLeast", predicate_value=-500)
+        result = _register_claim(contract, predicate_type="QuantityAtLeast", predicate_value=-500)
+    assert str(result).startswith("REJECTED: predicate_value must be >= 0")
 
 
 def test_register_claim_rejects_negative_quantity_for_quantity_equals(direct_vm, direct_deploy):
@@ -187,8 +188,8 @@ def test_register_claim_rejects_negative_quantity_for_quantity_equals(direct_vm,
     contract, *_ = _deploy_default(direct_deploy)
     alice = _addr("alice")
     with direct_vm.prank(alice):
-        with direct_vm.expect_revert("predicate_value must be >= 0"):
-            _register_claim(contract, predicate_type="QuantityEquals", predicate_value=-1)
+        result = _register_claim(contract, predicate_type="QuantityEquals", predicate_value=-1)
+    assert str(result).startswith("REJECTED: predicate_value must be >= 0")
 
 
 # --------------------------------------------------------------------- #
@@ -206,13 +207,13 @@ def test_invalidate_unknown_claim_reverts(direct_vm, direct_deploy):
 def test_expire_unknown_claim_reverts(direct_vm, direct_deploy):
     contract, *_ = _deploy_default(direct_deploy)
     with direct_vm.expect_revert("unknown claim_id"):
-        contract.expire_claim(b"\x99" * 32, 1_788_684_041)
+        contract.expire_claim(b"\x99" * 32)
 
 
 def test_adjudicate_unknown_claim_reverts(direct_vm, direct_deploy):
     contract, *_ = _deploy_default(direct_deploy)
     with direct_vm.expect_revert("unknown claim_id"):
-        contract.adjudicate_claim(b"\x99" * 32, 1_788_684_041)
+        contract.adjudicate_claim(b"\x99" * 32)
 
 
 # --------------------------------------------------------------------- #
@@ -294,3 +295,98 @@ def test_claim_id_accepted_as_plain_int_in_views(direct_vm, direct_deploy):
     unknown_claim_as_int = int.from_bytes(b"\x99" * 32, "big")
     with direct_vm.expect_revert("unknown claim_id"):
         contract.get_state(unknown_claim_as_int)
+
+
+def _param_names(method_name):
+    """Parameter names of a contract method, read from the contract source
+    (Direct Mode proxies do not expose signatures)."""
+    import ast
+    tree = ast.parse(open(CONTRACT_PATH).read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == method_name:
+            return [a.arg for a in node.args.args]
+    raise AssertionError(f"{method_name} not found in {CONTRACT_PATH}")
+
+
+def _set_tx_time(direct_vm, iso):
+    """Direct Mode's warp() does not refresh gl.message_raw['datetime'],
+    which is what the contracts read -- patch it explicitly as well."""
+    direct_vm.warp(iso)
+    from genlayer import gl
+    gl.message_raw["datetime"] = iso
+
+
+# --------------------------------------------------------------------- #
+# held deposits, process-graph wiring, verified payout, consensus time
+# --------------------------------------------------------------------- #
+
+
+def test_no_method_takes_a_caller_supplied_now(direct_vm, direct_deploy):
+    for name in ("register_claim", "adjudicate_claim", "expire_claim"):
+        assert "now" not in _param_names(name), name
+
+
+def test_set_process_graph_rejects_non_admin(direct_vm, direct_deploy):
+    contract, *_ = _deploy_default(direct_deploy)
+    mallory = _addr("mallory")
+    with direct_vm.prank(mallory):
+        with direct_vm.expect_revert("only admin"):
+            contract.set_process_graph(_addr("process_graph"))
+
+
+def test_set_process_graph_is_one_time(direct_vm, direct_deploy):
+    contract, _, _, admin = _deploy_default(direct_deploy)
+    with direct_vm.prank(admin):
+        contract.set_process_graph(_addr("process_graph"))
+        with direct_vm.expect_revert("already set"):
+            contract.set_process_graph(_addr("other_graph"))
+
+
+def test_release_deposit_unknown_claim_reverts(direct_vm, direct_deploy):
+    contract, *_ = _deploy_default(direct_deploy)
+    with direct_vm.expect_revert("unknown claim_id"):
+        contract.release_deposit(b"\x99" * 32)
+
+
+def test_get_bond_unknown_claim_reverts(direct_vm, direct_deploy):
+    contract, *_ = _deploy_default(direct_deploy)
+    with direct_vm.expect_revert("unknown claim_id"):
+        contract.get_bond(b"\x99" * 32)
+
+
+def test_is_evidence_eligible_unknown_claim_reverts(direct_vm, direct_deploy):
+    contract, *_ = _deploy_default(direct_deploy)
+    with direct_vm.expect_revert("unknown claim_id"):
+        contract.is_evidence_eligible(b"\x99" * 32)
+
+
+def test_rejected_register_claim_credits_withdrawable_then_withdraw_never_burns_credit(direct_vm, direct_deploy):
+    """A rejected payable register_claim credits the attached value. If the
+    verified payout path cannot run in this runtime, withdraw() must REVERT
+    and leave that credit intact -- it must never zero the ledger without
+    value moving. (When gl.evm exists, withdraw() succeeds instead and the
+    ledger is zeroed together with the transfer; this asserts the invariant
+    either way: credit is consumed IFF the call did not revert.)"""
+    contract, *_ = _deploy_default(direct_deploy)
+    alice = _addr("alice")
+    amount = 10**18
+    _set_tx_time(direct_vm, "2026-09-27T09:14:14.081651Z")
+    with direct_vm.prank(alice):
+        direct_vm.value = amount
+        result = _register_claim(contract, predicate_type="QuantityAtLeast", predicate_value=-1)
+        direct_vm.value = 0
+    assert str(result).startswith("REJECTED")
+    assert int(contract.get_withdrawable(str(alice))) == amount
+    reverted = False
+    with direct_vm.prank(alice):
+        try:
+            contract.withdraw()
+        except Exception:
+            reverted = True
+    remaining = int(contract.get_withdrawable(str(alice)))
+    assert (reverted and remaining == amount) or (not reverted and remaining == 0)
+
+
+def test_native_payout_never_uses_legacy_eoa_emit_transfer():
+    src = open(CONTRACT_PATH).read()
+    assert "gl.get_contract_at(Address(bytes.fromhex(hex_part))).emit_transfer" not in src
