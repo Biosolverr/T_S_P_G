@@ -173,6 +173,46 @@ _ALLOWED_TRANSITIONS = {
 }
 
 
+# =====================================================================
+# Consensus-backed transaction time (replaces every caller-supplied `now`).
+# =====================================================================
+# gl.message_raw["datetime"] is the transaction's datetime, fixed by the
+# consensus round and identical for leader and validators -- no caller can
+# choose it. Format: fixed-width ISO-8601 UTC, e.g. "2026-09-27T09:14:14.081651Z".
+# Parsed with integer math because the `datetime` module is not usable
+# inside contracts. Accessed lazily (inside a function, never at import
+# time) so that a runtime lacking it fails this call, not schema loading.
+
+def _days_from_civil(y: int, m: int, d: int) -> int:
+    y -= 1 if m <= 2 else 0
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _tx_now_or_none():
+    try:
+        s = str(gl.message_raw["datetime"])
+        if len(s) < 19 or s[4] != "-" or s[7] != "-" or s[10] not in ("T", " ") or s[13] != ":" or s[16] != ":":
+            return None
+        y, mo, d = int(s[0:4]), int(s[5:7]), int(s[8:10])
+        hh, mi, ss = int(s[11:13]), int(s[14:16]), int(s[17:19])
+        if not (1 <= mo <= 12 and 1 <= d <= 31 and hh < 24 and mi < 60 and ss < 61):
+            return None
+        return _days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss
+    except Exception:
+        return None
+
+
+def _tx_now() -> int:
+    v = _tx_now_or_none()
+    if v is None:
+        raise gl.vm.UserError("consensus transaction time (gl.message_raw['datetime']) is unavailable in this runtime")
+    return v
+
+
 def _coerce_bytes(val, length: int = 32) -> bytes:
     """Defensive coercion for bytes-typed public method arguments.
 
@@ -216,14 +256,15 @@ class EvidenceRegistry(gl.Contract):
         artifact_size: u32,
         mime_type: str,
         authority_commitment: bytes,
-        submitted_at: u64,
         scope_commitment: bytes,
         retrieval_hint_uri: str,
         schema_version: str,
     ) -> tuple[u32, str]:
         """Commit a new, immutable piece of evidence identity. Returns
         (evidence_id, evidence_commitment). `creator` is
-        `gl.message.sender_address` - immutable from this point on (S9)."""
+        `gl.message.sender_address` - immutable from this point on (S9).
+        `submitted_at` is the consensus transaction time, never a caller
+        argument."""
         artifact_hash = _coerce_bytes(artifact_hash)
         authority_commitment = _coerce_bytes(authority_commitment)
         scope_commitment = _coerce_bytes(scope_commitment)
@@ -238,7 +279,7 @@ class EvidenceRegistry(gl.Contract):
             mime_type=mime_type,
             creator=str(gl.message.sender_address),
             authority_commitment=authority_commitment,
-            submitted_at=submitted_at,
+            submitted_at=u64(_tx_now()),
             scope_commitment=scope_commitment,
         )
 
@@ -273,6 +314,16 @@ class EvidenceRegistry(gl.Contract):
             raise gl.vm.UserError(f"illegal evidence state transition: {record.state} -> {new_state}")
 
         record.state = new_state
+
+    @gl.public.view
+    def is_eligible(self, evidence_id: u32) -> bool:
+        """Evidence-state eligibility gate used by ClaimEngine (register,
+        adjudicate) and, through it, ProcessGraph (bind, finalize a slot).
+        Evidence is eligible unless it has been REVOKED or marked INVALID;
+        unknown ids are never eligible."""
+        if evidence_id not in self.evidence:
+            return False
+        return self.evidence[evidence_id].state in (EvidenceState.COMMITTED.value, EvidenceState.VALID.value)
 
     @gl.public.view
     def get_artifact_hash(self, evidence_id: u32) -> str:
