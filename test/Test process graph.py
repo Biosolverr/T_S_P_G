@@ -106,7 +106,7 @@ def test_add_claim_slot_unknown_process_reverts(direct_vm, direct_deploy):
 def test_commit_process_unknown_process_reverts(direct_vm, direct_deploy):
     contract, *_ = _deploy_default(direct_deploy)
     with direct_vm.expect_revert("unknown process_id"):
-        contract.commit_process(b"\x99" * 32, b"\x01" * 32, 1_788_684_041)
+        contract.commit_process(b"\x99" * 32, b"\x01" * 32)
 
 
 def test_activate_process_unknown_process_reverts(direct_vm, direct_deploy):
@@ -124,7 +124,7 @@ def test_cancel_process_unknown_process_reverts(direct_vm, direct_deploy):
 def test_bind_slot_unknown_slot_reverts(direct_vm, direct_deploy):
     contract, *_ = _deploy_default(direct_deploy)
     with direct_vm.expect_revert("unknown slot_id"):
-        contract.bind_slot(b"\x99" * 32, b"\x01" * 32, 1_788_684_041)
+        contract.bind_slot(b"\x99" * 32, b"\x01" * 32)
 
 
 def test_finalize_slot_unknown_slot_reverts(direct_vm, direct_deploy):
@@ -133,7 +133,7 @@ def test_finalize_slot_unknown_slot_reverts(direct_vm, direct_deploy):
     in this file: no slot can ever exist in Direct Mode."""
     contract, *_ = _deploy_default(direct_deploy)
     with direct_vm.expect_revert("unknown slot_id"):
-        contract.finalize_slot(b"\x99" * 32, 1_788_684_041)
+        contract.finalize_slot(b"\x99" * 32)
 
 
 def test_evaluate_unknown_process_reverts(direct_vm, direct_deploy):
@@ -145,7 +145,7 @@ def test_evaluate_unknown_process_reverts(direct_vm, direct_deploy):
 def test_finalize_process_unknown_process_reverts(direct_vm, direct_deploy):
     contract, *_ = _deploy_default(direct_deploy)
     with direct_vm.expect_revert("unknown process_id"):
-        contract.finalize_process(b"\x99" * 32, 1_788_684_041)
+        contract.finalize_process(b"\x99" * 32)
 
 
 def test_get_process_commitment_unknown_process_reverts(direct_vm, direct_deploy):
@@ -180,3 +180,31 @@ def test_process_id_accepted_as_plain_int(direct_vm, direct_deploy):
     unknown_process_as_int = int.from_bytes(b"\x99" * 32, "big")
     with direct_vm.expect_revert("unknown process_id"):
         contract.get_state(unknown_process_as_int)
+
+
+def _param_names(method_name):
+    """Parameter names of a contract method, read from the contract source
+    (Direct Mode proxies do not expose signatures)."""
+    import ast
+    tree = ast.parse(open(CONTRACT_PATH).read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == method_name:
+            return [a.arg for a in node.args.args]
+    raise AssertionError(f"{method_name} not found in {CONTRACT_PATH}")
+
+
+# --------------------------------------------------------------------- #
+# dispute-lock view + no caller-supplied time anywhere
+# --------------------------------------------------------------------- #
+
+
+def test_is_claim_locked_false_for_never_bound_claim(direct_vm, direct_deploy):
+    """A claim that was never bound to a slot holds no bond in any dispute,
+    so it is never locked."""
+    contract, *_ = _deploy_default(direct_deploy)
+    assert contract.is_claim_locked(b"\x99" * 32) is False
+
+
+def test_no_write_method_takes_a_caller_supplied_now(direct_vm, direct_deploy):
+    for name in ("create_process", "commit_process", "bind_slot", "finalize_slot", "finalize_process"):
+        assert "now" not in _param_names(name), name
