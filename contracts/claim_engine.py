@@ -399,6 +399,76 @@ def _claim_state_for_expiry(on_expiry: str) -> str:
     return ClaimState.UNKNOWN.value
 
 
+# =====================================================================
+# Consensus-backed transaction time (replaces every caller-supplied `now`).
+# =====================================================================
+# gl.message_raw["datetime"] is the transaction's datetime, fixed by the
+# consensus round and identical for leader and validators -- no caller can
+# choose it. Format: fixed-width ISO-8601 UTC, e.g. "2026-09-27T09:14:14.081651Z".
+# Parsed with integer math because the `datetime` module is not usable
+# inside contracts. Accessed lazily (inside a function, never at import
+# time) so that a runtime lacking it fails this call, not schema loading.
+
+def _days_from_civil(y: int, m: int, d: int) -> int:
+    y -= 1 if m <= 2 else 0
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _tx_now_or_none():
+    try:
+        s = str(gl.message_raw["datetime"])
+        if len(s) < 19 or s[4] != "-" or s[7] != "-" or s[10] not in ("T", " ") or s[13] != ":" or s[16] != ":":
+            return None
+        y, mo, d = int(s[0:4]), int(s[5:7]), int(s[8:10])
+        hh, mi, ss = int(s[11:13]), int(s[14:16]), int(s[17:19])
+        if not (1 <= mo <= 12 and 1 <= d <= 31 and hh < 24 and mi < 60 and ss < 61):
+            return None
+        return _days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss
+    except Exception:
+        return None
+
+
+def _tx_now() -> int:
+    v = _tx_now_or_none()
+    if v is None:
+        raise gl.vm.UserError("consensus transaction time (gl.message_raw['datetime']) is unavailable in this runtime")
+    return v
+
+
+# =====================================================================
+# Verified native payout path.
+# =====================================================================
+# Per the GenLayer value-transfer docs, a payout to an EOA is an EXTERNAL
+# message and must go through an EVM contract interface. The older call
+# form `gl.get_contract_at(eoa).emit_transfer(...)` is accepted by
+# consensus but moves nothing to a wallet (the value is only deducted
+# from this contract and parked in the message). It is therefore NOT used.
+#
+# `gl.evm` does not exist in every pinned build (KNOWN_ISSUES #9: a bare
+# `@gl.evm.contract_interface` crashes schema loading there), so it is
+# resolved defensively at import time. If it is missing, `_send_native`
+# refuses BEFORE any credit is consumed -- see below.
+
+class _RecipientSpec:
+    class View:
+        pass
+
+    class Write:
+        pass
+
+
+_evm_ns = getattr(gl, "evm", None)
+_EvmRecipient = (
+    _evm_ns.contract_interface(_RecipientSpec)
+    if (_evm_ns is not None and hasattr(_evm_ns, "contract_interface"))
+    else None
+)
+
+
 def _coerce_address(val) -> Address:
     """Defensive coercion for any Address-typed argument coming in from a
     public write/constructor call.
@@ -459,6 +529,8 @@ class ClaimEngine(gl.Contract):
     policy_registry_address: Address
     evidence_registry_address: Address
     admin_address: str
+    process_graph_address: Address
+    process_graph_set: bool
 
     claims: TreeMap[str, StoredClaim]
     claims_per_process: TreeMap[str, u32]
@@ -470,6 +542,20 @@ class ClaimEngine(gl.Contract):
         self.evidence_registry_address = _coerce_address(evidence_registry_address)
         self.admin_address = admin_address
         self.protocol_sink = u256(0)
+        self.process_graph_set = False
+
+    @gl.public.write
+    def set_process_graph(self, process_graph_address: Address) -> None:
+        """One-time wiring (admin only). ProcessGraph's constructor needs
+        this contract's address, so the reverse link cannot be a
+        constructor argument. Needed so a TRUE/FALSE claim's deposit can be
+        held while its slot dispute is unresolved (see release_deposit)."""
+        if str(gl.message.sender_address) != self.admin_address:
+            raise gl.vm.UserError("only admin may set the process graph address")
+        if self.process_graph_set:
+            raise gl.vm.UserError("process graph address is already set and cannot be changed")
+        self.process_graph_address = _coerce_address(process_graph_address)
+        self.process_graph_set = True
 
     @gl.public.write.payable
     def register_claim(
@@ -491,7 +577,6 @@ class ClaimEngine(gl.Contract):
         expected_evidence_commitment: bytes,
         schema_version: str,
         scope: str,
-        now: u64,
     ) -> str:
         process_commitment = _coerce_bytes(process_commitment)
         policy_id = _coerce_bytes(policy_id)
@@ -500,6 +585,13 @@ class ClaimEngine(gl.Contract):
         expected_evidence_commitment = _coerce_bytes(expected_evidence_commitment)
         sender_str = str(gl.message.sender_address)
         refund_amount = u256(int(gl.message.value))
+        # Consensus transaction time, never a caller argument. Fetched
+        # without raising: this method is payable, so a revert would strand
+        # the attached value (see SECURITY.md).
+        now = _tx_now_or_none()
+        if now is None:
+            self._credit_withdrawable(sender_str, refund_amount)
+            return "REJECTED: consensus transaction time is unavailable in this runtime"
         try:
             PredicateType(predicate_type)
         except ValueError:
@@ -554,19 +646,13 @@ class ClaimEngine(gl.Contract):
             self._credit_withdrawable(sender_str, refund_amount)
             return "REJECTED: " + (f"evidence artifact_size {artifact_size} exceeds policy max_evidence_size {max_evidence_size}")
 
-        # Partial mitigation for the caller-supplied-`now` trust gap (see
-        # SECURITY.md "Caller-supplied time" and the comment in
-        # adjudicate_claim): a claim asserting something about a piece of
-        # evidence should not be able to claim a `now` earlier than when
-        # that evidence itself was submitted. This does not verify `now`
-        # against real wall-clock time (impossible without an on-chain
-        # clock in this build), only against this one relative fact this
-        # contract already has independently, via EvidenceRegistry.
-        evidence_submitted_at = evidence_registry.view().get_submitted_at(evidence_id)
-        if int(now) < int(evidence_submitted_at):
+        # Evidence-state eligibility (enforced, not decorative): evidence
+        # that has been REVOKED or marked INVALID can never back a new claim.
+        # It is re-checked at adjudicate_claim and again by ProcessGraph
+        # when a slot is bound or finalized, since state can change later.
+        if not evidence_registry.view().is_eligible(evidence_id):
             self._credit_withdrawable(sender_str, refund_amount)
-            return "REJECTED: " + (f"now ({now}) precedes the referenced evidence's own submitted_at "
-                f"({evidence_submitted_at}) - a claim cannot assert evidence from the future")
+            return "REJECTED: " + ("evidence is not in an eligible state (REVOKED or INVALID)")
 
         predicate_size = (
             len(predicate_unit.encode("utf-8"))
@@ -592,7 +678,7 @@ class ClaimEngine(gl.Contract):
             self._credit_withdrawable(sender_str, refund_amount)
             return "REJECTED: " + ("POLICY/GLOBAL claim scope is not implemented in this MVP - see SECURITY.md")
 
-        asserted_at = now
+        asserted_at = now  # consensus time
 
         stored = StoredClaim(
             process_commitment=process_commitment,
@@ -633,7 +719,7 @@ class ClaimEngine(gl.Contract):
         return claim_key
 
     @gl.public.write
-    def adjudicate_claim(self, claim_id: bytes, now: u64) -> str:
+    def adjudicate_claim(self, claim_id: bytes) -> str:
         claim_id = _coerce_bytes(claim_id)
         claim_key = claim_id.hex()
         if claim_key not in self.claims:
@@ -643,32 +729,25 @@ class ClaimEngine(gl.Contract):
         if stored.state != ClaimState.REGISTERED.value:
             raise gl.vm.UserError(f"claim is in state {stored.state!r} - only REGISTERED claims can be adjudicated (spec S19)")
 
-        # Partial mitigation for the caller-supplied-`now` trust gap
-        # documented in SECURITY.md ("Caller-supplied time"): there is no
-        # on-chain clock in this GenVM build (KNOWN_ISSUES.md #5), so `now`
-        # cannot be verified against reality -- but it CAN be constrained
-        # to be monotonic within this claim's own lifecycle. Without this,
-        # a caller could call adjudicate_claim with a `now` earlier than
-        # the `now` they themselves supplied at register_claim time,
-        # trivially defeating the freshness check below regardless of how
-        # much real time has actually passed. This does not close the gap
-        # entirely (register_claim's own `now` is still caller-asserted,
-        # unchecked against anything at that point), only the "go
-        # backwards relative to your own prior call on this claim" case.
-        if int(now) < int(stored.asserted_at):
-            raise gl.vm.UserError(
-                f"now ({now}) precedes this claim's own asserted_at ({stored.asserted_at}) "
-                "- time must be monotonic within a claim's lifecycle"
-            )
-
         policy_registry = gl.get_contract_at(self.policy_registry_address)
         evidence_registry = gl.get_contract_at(self.evidence_registry_address)
+
+        # Evidence-state eligibility, re-checked at adjudication: the
+        # evidence may have been REVOKED/INVALIDATED after registration. The
+        # claim cannot be established on it; the submitter did nothing
+        # wrong, so the deposit is refunded rather than forfeited.
+        if not evidence_registry.view().is_eligible(stored.evidence_id):
+            stored.state = ClaimState.UNKNOWN.value
+            self._refund_deposit(stored)
+            return stored.state
+
+        # Consensus transaction time -- not caller-controlled.
+        now = _tx_now()
 
         max_age, on_expiry = policy_registry.view().get_freshness(stored.policy_id, stored.policy_version)
         evidence_submitted_at = evidence_registry.view().get_submitted_at(stored.evidence_id)
 
         if int(max_age) > 0:
-            now = int(now)
             if now - int(evidence_submitted_at) > int(max_age):
                 stored.state = _claim_state_for_expiry(on_expiry)
                 self._settle_deposit(stored)
@@ -754,9 +833,14 @@ class ClaimEngine(gl.Contract):
             raise gl.vm.UserError("policy does not permit revocation for this claim")
 
         stored.state = ClaimState.INVALIDATED.value
+        # A TRUE claim's deposit is held (not refunded) until its slot
+        # dispute resolves and release_deposit is called, so revoking the
+        # claim while it is still held forfeits it, same as any other
+        # INVALIDATED outcome. A no-op if already released.
+        self._settle_deposit(stored)
 
     @gl.public.write
-    def expire_claim(self, claim_id: bytes, now: u64) -> str:
+    def expire_claim(self, claim_id: bytes) -> str:
         claim_id = _coerce_bytes(claim_id)
         claim_key = claim_id.hex()
         if claim_key not in self.claims:
@@ -766,19 +850,11 @@ class ClaimEngine(gl.Contract):
         if stored.state not in (ClaimState.REGISTERED.value, ClaimState.ADJUDICATING.value, ClaimState.UNKNOWN.value):
             raise gl.vm.UserError(f"cannot expire a claim in terminal state {stored.state!r}")
 
-        # Same monotonicity mitigation as adjudicate_claim -- see the
-        # comment there.
-        if int(now) < int(stored.asserted_at):
-            raise gl.vm.UserError(
-                f"now ({now}) precedes this claim's own asserted_at ({stored.asserted_at}) "
-                "- time must be monotonic within a claim's lifecycle"
-            )
-
         policy_registry = gl.get_contract_at(self.policy_registry_address)
         evidence_registry = gl.get_contract_at(self.evidence_registry_address)
 
         max_age, on_expiry = policy_registry.view().get_freshness(stored.policy_id, stored.policy_version)
-        now = int(now)
+        now = _tx_now()  # consensus time -- not caller-controlled
 
         # These are two independent policy-author decisions and must not
         # gate each other (found in review, session 2026-09-14): a policy
@@ -818,15 +894,52 @@ class ClaimEngine(gl.Contract):
         return stored.state
 
     def _settle_deposit(self, stored: StoredClaim) -> None:
+        """Settles a claim's deposit at the moment its outcome is known.
+
+        UNKNOWN / EXPIRED / INVALIDATED forfeit to the protocol sink.
+        TRUE / FALSE deliberately settle NOTHING here: that deposit is the
+        claim's bond in ProcessGraph's dispute window, so it must stay
+        locked (not refundable) for as long as it is counted as a bond.
+        It is returned only by release_deposit(), once ProcessGraph says
+        the claim is no longer the pending candidate of an unresolved slot."""
         if stored.deposit_settled:
             return
-        if stored.state in _REFUND_STATES:
-            current = self.withdrawable[stored.submitter] if stored.submitter in self.withdrawable else u256(0)
-            self.withdrawable[stored.submitter] = u256(int(current) + int(stored.deposit_amount))
-            stored.deposit_settled = True
-        elif stored.state in _FORFEIT_STATES or stored.state == ClaimState.INVALIDATED.value:
+        if stored.state in _FORFEIT_STATES or stored.state == ClaimState.INVALIDATED.value:
             self.protocol_sink = u256(int(self.protocol_sink) + int(stored.deposit_amount))
             stored.deposit_settled = True
+
+    def _refund_deposit(self, stored: StoredClaim) -> None:
+        if stored.deposit_settled:
+            return
+        self._credit_withdrawable(stored.submitter, stored.deposit_amount)
+        stored.deposit_settled = True
+
+    @gl.public.write
+    def release_deposit(self, claim_id: bytes) -> u256:
+        """Permissionless (funds only ever go to the claim's own submitter).
+        Moves a TRUE/FALSE claim's held deposit into its withdrawable
+        balance -- refused while the claim is the pending candidate of a
+        slot whose dispute window is still open. After release the claim has
+        no bond left (get_bond == 0), so ProcessGraph will not accept it as
+        a binding or a challenge."""
+        claim_id = _coerce_bytes(claim_id)
+        claim_key = claim_id.hex()
+        if claim_key not in self.claims:
+            raise gl.vm.UserError("unknown claim_id")
+        stored = self.claims[claim_key]
+        if stored.deposit_settled:
+            raise gl.vm.UserError("deposit already settled")
+        if stored.state not in _REFUND_STATES:
+            raise gl.vm.UserError("only TRUE/FALSE claims hold a releasable deposit")
+        if not self.process_graph_set:
+            raise gl.vm.UserError("process graph address is not configured - cannot check the dispute lock")
+        process_graph = gl.get_contract_at(self.process_graph_address)
+        if process_graph.view().is_claim_locked(claim_id):
+            raise gl.vm.UserError("deposit is locked: this claim is the pending candidate of a slot whose dispute is unresolved")
+        amount = stored.deposit_amount
+        stored.deposit_settled = True
+        self._credit_withdrawable(stored.submitter, amount)
+        return amount
 
     def _credit_withdrawable(self, address: str, amount: u256) -> None:
         """Credit `amount` to `address`'s withdrawable balance directly,
@@ -843,31 +956,50 @@ class ClaimEngine(gl.Contract):
         current = self.withdrawable[address] if address in self.withdrawable else u256(0)
         self.withdrawable[address] = u256(int(current) + int(amount))
 
-    def _send_native(self, to_address: str, amount: u256) -> None:
-        """Call-site UNVERIFIED against a live GenVM node.
-
-        Two confirmed bugs fixed here so far, found live on Studio:
-        1. `to_address` is `str(gl.message.sender_address)`, which includes
-           a "0x" prefix that `bytes.fromhex` rejects. Stripped it.
-        2. `gl.get_contract_at` requires an `Address` object, not raw
-           `bytes` (`TypeError: address expected` otherwise). Wrapped it.
-
-        Still unverified: community reports from other GenLayer projects
-        say this call form (`gl.get_contract_at(...).emit_transfer(...)`)
-        returns FINISHED_WITH_RETURN and moves zero wei against a plain
-        wallet (EOA) address, with no error at all, and that a wallet
-        payout needs a `@gl.evm.contract_interface` declaration instead.
-        That symbol does not exist in this pinned build (`gl.evm` ->
-        AttributeError, breaks schema loading entirely -- do not
-        reintroduce it without confirming the correct namespace for this
-        exact py-genlayer version first). Until this call is confirmed to
-        actually move funds against a real EOA on this build, treat
-        withdraw() and withdraw_protocol_sink() as unverified: a clean
-        SUCCESS here does not by itself prove the recipient's balance
-        changed.
-        """
+    def _payout_recipient(self, to_address: str) -> Address:
         hex_part = to_address[2:] if to_address.startswith(("0x", "0X")) else to_address
-        gl.get_contract_at(Address(bytes.fromhex(hex_part))).emit_transfer(value=amount)
+        try:
+            return Address(bytes.fromhex(hex_part))
+        except Exception:
+            raise gl.vm.UserError(f"invalid recipient address: {to_address!r}")
+
+    def _require_payout_possible(self, amount: u256) -> None:
+        """Pre-debit gate: the verified EVM-interface path exists in this
+        runtime, the balance is readable, and it covers `amount`."""
+        if _EvmRecipient is None:
+            raise gl.vm.UserError(
+                "verified native payout path (gl.evm.contract_interface) is unavailable in this "
+                "runtime - refusing to debit a balance without a way to move the value"
+            )
+        try:
+            balance = int(self.balance)
+        except Exception:
+            raise gl.vm.UserError("contract balance is unreadable in this runtime - refusing to pay out")
+        if balance < int(amount):
+            raise gl.vm.UserError("contract balance is lower than the amount owed")
+
+    def _send_native(self, recipient: Address, amount: u256) -> None:
+        """Verified payout. Either the value leaves this contract through the
+        documented EVM-interface path, or this call REVERTS -- and because a
+        revert rolls back the whole execution, the caller's `withdrawable`
+        (or the protocol sink) is never debited without value moving.
+
+        Checks, in order, all before/around the emit:
+        1. The EOA-capable path (`gl.evm.contract_interface`) must exist in
+           this runtime. If it does not, refuse. The legacy
+           `gl.get_contract_at(eoa).emit_transfer(...)` is never used as a
+           fallback: it deducts value but does not pay a wallet.
+        2. The contract balance must cover the amount.
+        3. After the emit, this contract's balance must have dropped by
+           exactly `amount` (value is deducted immediately when the message
+           is emitted; the wallet is credited when it finalizes).
+        """
+        self._require_payout_possible(amount)
+        before = int(self.balance)
+        _EvmRecipient(recipient).emit_transfer(value=amount)
+        after = int(self.balance)
+        if before - after != int(amount):
+            raise gl.vm.UserError("transfer was not deducted from the contract balance - reverting")
 
     @gl.public.write
     def withdraw(self) -> u256:
@@ -875,8 +1007,14 @@ class ClaimEngine(gl.Contract):
         amount = self.withdrawable[sender] if sender in self.withdrawable else u256(0)
         if int(amount) == 0:
             raise gl.vm.UserError("nothing to withdraw")
+        # Every precondition of the payout is checked BEFORE the ledger is
+        # touched, so a runtime that cannot pay out never even reaches the
+        # debit. The post-emit balance check inside _send_native is the only
+        # step after it, and it reverts the whole execution on failure.
+        recipient = self._payout_recipient(sender)
+        self._require_payout_possible(amount)
         self.withdrawable[sender] = u256(0)
-        self._send_native(sender, amount)
+        self._send_native(recipient, amount)
         return amount
 
     @gl.public.write
@@ -886,8 +1024,10 @@ class ClaimEngine(gl.Contract):
         amount = self.protocol_sink
         if int(amount) == 0:
             raise gl.vm.UserError("protocol sink is empty")
+        recipient = self._payout_recipient(to)
+        self._require_payout_possible(amount)
         self.protocol_sink = u256(0)
-        self._send_native(to, amount)
+        self._send_native(recipient, amount)
         return amount
 
     @gl.public.view
@@ -918,6 +1058,32 @@ class ClaimEngine(gl.Contract):
         if claim_key not in self.claims:
             raise gl.vm.UserError("unknown claim_id")
         return self.claims[claim_key].deposit_amount
+
+    @gl.public.view
+    def get_bond(self, claim_id: bytes) -> u256:
+        """The deposit currently HELD for this claim, i.e. what may count as
+        its bond in ProcessGraph's dispute window. Zero unless the claim is
+        TRUE/FALSE and its deposit has not been released or settled -- so a
+        deposit that was already refunded can never be counted as a bond."""
+        claim_id = _coerce_bytes(claim_id)
+        claim_key = claim_id.hex()
+        if claim_key not in self.claims:
+            raise gl.vm.UserError("unknown claim_id")
+        s = self.claims[claim_key]
+        if s.deposit_settled or s.state not in _REFUND_STATES:
+            return u256(0)
+        return s.deposit_amount
+
+    @gl.public.view
+    def is_evidence_eligible(self, claim_id: bytes) -> bool:
+        """Live evidence-state check for the claim's evidence; ProcessGraph
+        calls this when binding and finalizing a slot."""
+        claim_id = _coerce_bytes(claim_id)
+        claim_key = claim_id.hex()
+        if claim_key not in self.claims:
+            raise gl.vm.UserError("unknown claim_id")
+        evidence_registry = gl.get_contract_at(self.evidence_registry_address)
+        return evidence_registry.view().is_eligible(self.claims[claim_key].evidence_id)
 
     @gl.public.view
     def get_provenance(self, claim_id: bytes) -> tuple[str, str, str, str, str]:
