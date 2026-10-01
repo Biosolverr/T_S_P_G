@@ -105,11 +105,6 @@ class FreshnessOnExpiry(str, enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class QuorumRules:
-    min_unique_validators: int
-
-
-@dataclasses.dataclass(frozen=True)
 class GraphLimits:
     max_graph_nodes: int
     max_graph_edges: int
@@ -123,11 +118,18 @@ class GraphLimits:
 class PolicyContent:
     """The immutable, hashed payload of a policy version. Binds
     policy_id and version into the hash itself. `authority_rules_commitment`
-    is opaque bytes - authority resolution is out of scope for this MVP."""
+    is opaque bytes - authority resolution is out of scope for this MVP.
+
+    There is deliberately NO validator-quorum field here. A "minimum
+    unique validators" setting used to be stored and hashed but nothing
+    could ever enforce it: validator selection and agreement are done by
+    GenLayer consensus itself (gl.eq_principle.strict_eq), and contract
+    code cannot see or count which validators voted. A requirement that
+    is configurable but unenforceable is worse than none, so it was
+    removed rather than left decorative."""
     policy_id: bytes
     version: int
     predicate_rules: tuple
-    quorum_rules: QuorumRules
     evidence_max_age_seconds: int
     evidence_freshness_on_expiry: FreshnessOnExpiry
     authority_rules_commitment: bytes
@@ -174,7 +176,6 @@ class StoredPolicyRecord:
     version: u32
     registrant: str                               # gates set_active()
     predicate_rules: str  # comma-joined PredicateType values; DynArray[str] cannot be freshly constructed in this runtime
-    min_unique_validators: u32
     evidence_max_age_seconds: u64
     evidence_freshness_on_expiry: str
     authority_rules_commitment: bytes
@@ -196,7 +197,6 @@ def _to_content(stored: StoredPolicyRecord) -> PolicyContent:
         policy_id=stored.policy_id,
         version=int(stored.version),
         predicate_rules=tuple(PredicateType(p) for p in stored.predicate_rules.split(",") if p),
-        quorum_rules=QuorumRules(min_unique_validators=int(stored.min_unique_validators)),
         evidence_max_age_seconds=int(stored.evidence_max_age_seconds),
         evidence_freshness_on_expiry=FreshnessOnExpiry(stored.evidence_freshness_on_expiry),
         authority_rules_commitment=stored.authority_rules_commitment,
@@ -256,7 +256,6 @@ class PolicyRegistry(gl.Contract):
         policy_id: bytes,
         version: u32,
         predicate_rules: list[str],
-        min_unique_validators: u32,
         evidence_max_age_seconds: u64,
         evidence_freshness_on_expiry: str,
         authority_rules_commitment: bytes,
@@ -274,9 +273,6 @@ class PolicyRegistry(gl.Contract):
 
         if key in self.policies and version in self.policies[key]:
             raise gl.vm.UserError("policy version already registered - cannot mutate an existing version")
-
-        if int(min_unique_validators) < 1:
-            raise gl.vm.UserError("min_unique_validators must be >= 1 (spec S36)")
 
         for pr in predicate_rules:
             PredicateType(pr)  # fail closed on unknown predicate type
@@ -302,7 +298,6 @@ class PolicyRegistry(gl.Contract):
             version=version,
             registrant=str(gl.message.sender_address),
             predicate_rules=predicate_rules_str,
-            min_unique_validators=min_unique_validators,
             evidence_max_age_seconds=evidence_max_age_seconds,
             evidence_freshness_on_expiry=evidence_freshness_on_expiry,
             authority_rules_commitment=authority_rules_commitment,
@@ -373,14 +368,6 @@ class PolicyRegistry(gl.Contract):
         return recomputed == expected_hash
 
     @gl.public.view
-    def get_min_unique_validators(self, policy_id: bytes, version: u32) -> u32:
-        policy_id = _coerce_bytes(policy_id)
-        key = _policy_key(policy_id)
-        if key not in self.policies or version not in self.policies[key]:
-            raise gl.vm.UserError("unknown policy version")
-        return self.policies[key][version].min_unique_validators
-
-    @gl.public.view
     def get_predicate_rules(self, policy_id: bytes, version: u32) -> list[str]:
         """Added (session 2026-09-14, finding #3): this field was stored
         and hashed since the beginning but never exposed via any getter,
@@ -430,4 +417,3 @@ class PolicyRegistry(gl.Contract):
         if key not in self.policies or version not in self.policies[key]:
             raise gl.vm.UserError("unknown policy version")
         return self.policies[key][version].min_deposit
-
