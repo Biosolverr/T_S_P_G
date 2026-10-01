@@ -44,7 +44,6 @@ def _register(
     policy_id=b"\x01" * 32,
     version=1,
     predicate_rules=None,
-    min_unique_validators=3,
     evidence_max_age_seconds=2_592_000,
     evidence_freshness_on_expiry="UNKNOWN",
     authority_rules_commitment=b"\x02" * 32,
@@ -58,7 +57,6 @@ def _register(
         policy_id,
         version,
         predicate_rules if predicate_rules is not None else ["QuantityAtLeast"],
-        min_unique_validators,
         evidence_max_age_seconds,
         evidence_freshness_on_expiry,
         authority_rules_commitment,
@@ -107,7 +105,7 @@ def test_same_policy_id_different_version_allowed(direct_vm, direct_deploy):
     alice = _addr("alice")
     with direct_vm.prank(alice):
         h1 = _register(contract, version=1)
-        h2 = _register(contract, version=2, min_unique_validators=5)
+        h2 = _register(contract, version=2)
     assert h1 != h2
     assert contract.is_active(b"\x01" * 32, 1) is True
     assert contract.is_active(b"\x01" * 32, 2) is True
@@ -139,14 +137,6 @@ def test_policy_id_accepted_as_plain_int(direct_vm, direct_deploy):
 # --------------------------------------------------------------------- #
 # register_policy: validation
 # --------------------------------------------------------------------- #
-
-
-def test_min_unique_validators_must_be_positive(direct_vm, direct_deploy):
-    contract = _deploy(direct_deploy)
-    alice = _addr("alice")
-    with direct_vm.prank(alice):
-        with direct_vm.expect_revert("min_unique_validators"):
-            _register(contract, min_unique_validators=0)
 
 
 def test_unknown_predicate_type_rejected(direct_vm, direct_deploy):
@@ -270,14 +260,6 @@ def test_verify_commitment_false_for_wrong_hash(direct_vm, direct_deploy):
     assert contract.verify_commitment(b"\x01" * 32, 1, b"\xff" * 32) is False
 
 
-def test_get_min_unique_validators_matches_input(direct_vm, direct_deploy):
-    contract = _deploy(direct_deploy)
-    alice = _addr("alice")
-    with direct_vm.prank(alice):
-        _register(contract, min_unique_validators=7)
-    assert contract.get_min_unique_validators(b"\x01" * 32, 1) == 7
-
-
 def test_get_predicate_rules_matches_input(direct_vm, direct_deploy):
     """get_predicate_rules was added so ClaimEngine.register_claim could
     actually enforce a policy's predicate_rules whitelist (see the
@@ -330,7 +312,6 @@ def test_views_revert_on_unknown_version(direct_vm, direct_deploy):
     contract = _deploy(direct_deploy)
     for method, args in [
         ("get_policy_hash", (b"\x99" * 32, 1)),
-        ("get_min_unique_validators", (b"\x99" * 32, 1)),
         ("get_predicate_rules", (b"\x99" * 32, 1)),
         ("get_graph_limits", (b"\x99" * 32, 1)),
         ("get_allow_revocation_retry", (b"\x99" * 32, 1)),
